@@ -340,7 +340,7 @@ class MediaDateFixerApp:
         self.errors.clear()
         self.close_when_done = False
         self._set_busy(True)
-        self.status.set("파일 목록 확인 중")
+        self.status.set("파일 이름 분석 중")
         self.percent.set("")
         self.progress.configure(mode="indeterminate", value=0)
         self.progress.start(12)
@@ -388,7 +388,7 @@ class MediaDateFixerApp:
 
     def _show_progress(self, current, total, detail):
         if total is None:
-            self.status.set(f"파일 목록 확인 중 ({current:,}개)")
+            self.status.set(f"파일 이름 분석 중 ({current:,}개)")
             return
         self.progress.stop()
         self.progress.configure(

@@ -5,10 +5,12 @@ import argparse
 import csv
 import json
 import os
+import queue
 import re
 import stat
 import subprocess
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -73,6 +75,7 @@ PLACEHOLDER_FLAGS = (
     | FILE_ATTRIBUTE_RECALL_ON_OPEN
     | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
 )
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def parse_args():
@@ -222,7 +225,118 @@ def exiftool_environment():
     return environment
 
 
-def run_exiftool(executable, arguments):
+class ExifToolSession:
+    def __init__(self, executable):
+        try:
+            self.process = subprocess.Popen(
+                [
+                    executable,
+                    "-charset",
+                    "filename=utf8",
+                    "-stay_open",
+                    "True",
+                    "-@",
+                    "-",
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                shell=False,
+                env=exiftool_environment(),
+                creationflags=NO_WINDOW,
+            )
+        except OSError as error:
+            raise RuntimeError(f"ExifTool 실행 실패: {error}") from error
+        self.command_id = 0
+        self.error_lines = queue.SimpleQueue()
+        self.error_thread = threading.Thread(target=self._read_errors, daemon=True)
+        self.error_thread.start()
+
+    def _read_errors(self):
+        for line in self.process.stderr:
+            self.error_lines.put(line)
+        self.error_lines.put(None)
+
+    def execute(self, arguments):
+        if self.process.poll() is not None:
+            raise RuntimeError(
+                f"ExifTool이 예기치 않게 종료되었습니다: {self.process.returncode}"
+            )
+        self.command_id += 1
+        command_id = self.command_id
+        status_marker = f"__MEDIA_DATE_FIXER_STATUS_{command_id}__="
+        payload = "\n".join(
+            [
+                *arguments,
+                "-echo4",
+                status_marker + "${status}",
+                f"-execute{command_id}",
+                "",
+            ]
+        )
+        try:
+            self.process.stdin.write(payload)
+            self.process.stdin.flush()
+        except (BrokenPipeError, OSError) as error:
+            raise RuntimeError(f"ExifTool 명령 전송 실패: {error}") from error
+
+        output_lines = []
+        ready = f"{{ready{command_id}}}"
+        while True:
+            line = self.process.stdout.readline()
+            if not line:
+                raise RuntimeError("ExifTool 응답을 받기 전에 프로세스가 종료되었습니다.")
+            if line.rstrip("\r\n") == ready:
+                break
+            output_lines.append(line)
+
+        error_lines = []
+        while True:
+            line = self.error_lines.get()
+            if line is None:
+                raise RuntimeError("ExifTool 종료 상태를 받지 못했습니다.")
+            text = line.rstrip("\r\n")
+            if text.startswith(status_marker):
+                try:
+                    status = int(text[len(status_marker) :])
+                except ValueError as error:
+                    raise RuntimeError(f"ExifTool 종료 상태 해석 실패: {text}") from error
+                break
+            error_lines.append(line)
+        return status, "".join(output_lines).strip(), "".join(error_lines).strip()
+
+    def close(self):
+        process = self.process
+        if process.poll() is None:
+            try:
+                process.stdin.write("-stay_open\nFalse\n")
+                process.stdin.flush()
+                process.wait(timeout=10)
+            except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+        self.error_thread.join(timeout=2)
+        for pipe in (process.stdin, process.stdout, process.stderr):
+            pipe.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+
+def run_exiftool(executable, arguments, session=None):
+    if session is not None:
+        return session.execute(arguments)
     # stdin is an UTF-8 ExifTool argument file, avoiding Windows code-page loss.
     payload = ("\n".join(arguments) + "\n").encode("utf-8")
     try:
@@ -234,6 +348,7 @@ def run_exiftool(executable, arguments):
             shell=False,
             check=False,
             env=exiftool_environment(),
+            creationflags=NO_WINDOW,
         )
     except OSError as error:
         raise RuntimeError(f"ExifTool 실행 실패: {error}") from error
@@ -242,26 +357,14 @@ def run_exiftool(executable, arguments):
     )
 
 
-def exiftool_version(executable):
-    try:
-        completed = subprocess.run(
-            [executable, "-ver"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            check=False,
-            env=exiftool_environment(),
-        )
-    except OSError as error:
-        raise RuntimeError(f"ExifTool을 찾거나 실행할 수 없습니다: {error}") from error
-    version = decode_output(completed.stdout)
-    error = decode_output(completed.stderr)
-    if completed.returncode or not version:
+def exiftool_version(executable, session=None):
+    code, version, error = run_exiftool(executable, ["-ver"], session)
+    if code or not version:
         raise RuntimeError(error or "ExifTool 버전을 확인하지 못했습니다.")
     return version
 
 
-def read_metadata(executable, path, video=False):
+def read_metadata(executable, path, video=False, session=None):
     arguments = ["-j", "-a", "-G1", "-s"]
     if video:
         arguments += [
@@ -271,7 +374,7 @@ def read_metadata(executable, path, video=False):
             "%Y-%m-%dT%H:%M:%S%z",
         ]
     arguments += ["-time:all", str(path)]
-    code, output, error = run_exiftool(executable, arguments)
+    code, output, error = run_exiftool(executable, arguments, session)
     if code:
         raise RuntimeError(error or output or f"ExifTool 읽기 종료 코드 {code}")
     if error:
@@ -357,13 +460,13 @@ def system_times(metadata):
     return result
 
 
-def write_metadata(executable, path, planned, no_backup):
+def write_metadata(executable, path, planned, no_backup, session=None):
     arguments = ["-P"]
     if no_backup:
         arguments.append("-overwrite_original")
     arguments += [f"-{tag}={value}" for tag, value in planned.items()]
     arguments.append(str(path))
-    return run_exiftool(executable, arguments)
+    return run_exiftool(executable, arguments, session)
 
 
 def restore_access_and_modify_times(path, before):
@@ -548,12 +651,6 @@ def process_media(
     if getattr(root_details, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT:
         emit(f"ERROR: 루트가 재분석 지점입니다: {root}", error=True)
         return 2, None, None
-    try:
-        version = exiftool_version(exiftool)
-    except RuntimeError as error:
-        emit(f"ERROR: {error}", error=True)
-        return 2, None, None
-
     upper_bound = datetime.now(UTC) + timedelta(days=1)
     lower_bound = datetime(2000, 1, 1, tzinfo=UTC)
     log_dir = Path(log_dir) if log_dir else Path.cwd()
@@ -565,6 +662,15 @@ def process_media(
     log_path = log_dir / datetime.now().strftime(
         "fix_media_dates_%Y%m%d_%H%M%S_%f.csv"
     )
+    session = None
+    try:
+        session = ExifToolSession(exiftool)
+        version = exiftool_version(exiftool, session)
+    except RuntimeError as error:
+        if session is not None:
+            session.close()
+        emit(f"ERROR: {error}", error=True)
+        return 2, None, None
     stats = {
         "total": 0,
         "matched": 0,
@@ -593,28 +699,41 @@ def process_media(
             "각 파일에서 적용 전후 값을 확인합니다. 확인할 수 없으면 수정하지 않습니다."
         )
 
-    if on_progress or should_stop:
-        files = []
-        if on_progress:
-            on_progress(0, None, "파일 목록 확인 중")
-        for item in scan_files(root):
-            if should_stop and should_stop():
-                stats["cancelled"] = 1
-                files.clear()
-                break
-            files.append(item)
-            if on_progress and len(files) % 100 == 0:
-                on_progress(len(files), None, "파일 목록 확인 중")
-        total_files = len(files)
-    else:
-        files = scan_files(root)
-        total_files = None
+    groups = {"jpeg": [], "png": [], "video": [], "other": []}
+    if on_progress:
+        on_progress(0, None, "파일 이름 분석 중")
+    scanned = 0
+    for path, scanned_details, scan_error in scan_files(root):
+        if should_stop and should_stop():
+            stats["cancelled"] = 1
+            for group in groups.values():
+                group.clear()
+            break
+        scanned += 1
+        match = (
+            match_filename(path.name)
+            if scanned_details is not None and not is_temporary_or_backup(path.name)
+            else None
+        )
+        if not match or not match["supported"]:
+            family = "other"
+        elif match["extension"] in {".jpg", ".jpeg"}:
+            family = "jpeg"
+        elif match["extension"] == ".png":
+            family = "png"
+        else:
+            family = "video"
+        groups[family].append((path, scanned_details, scan_error, match))
+        if on_progress and scanned % 100 == 0:
+            on_progress(scanned, None, "파일 이름 분석 중")
+    files = [item for group in groups.values() for item in group]
+    total_files = len(files)
 
     processed = 0
-    with log_path.open("x", encoding="utf-8-sig", newline="") as log_file:
+    with session, log_path.open("x", encoding="utf-8-sig", newline="") as log_file:
         writer = csv.DictWriter(log_file, fieldnames=CSV_FIELDS)
         writer.writeheader()
-        for index, (path, scanned_details, scan_error) in enumerate(files, 1):
+        for index, (path, scanned_details, scan_error, match) in enumerate(files, 1):
             if should_stop and should_stop():
                 stats["cancelled"] = 1
                 break
@@ -635,7 +754,6 @@ def process_media(
                     record_skip(writer, row, "SKIPPED", "TEMP_OR_BACKUP")
                 continue
 
-            match = match_filename(path.name)
             if not match:
                 stats["pattern_mismatch"] += 1
                 if log_all_skips:
@@ -686,7 +804,7 @@ def process_media(
             try:
                 before = path.stat()
                 try:
-                    metadata = read_metadata(exiftool, path, video)
+                    metadata = read_metadata(exiftool, path, video, session)
                 finally:
                     restore_access_and_modify_times(path, before)
                 after_read = path.stat()
@@ -753,12 +871,12 @@ def process_media(
                 if not same_source_state(before, current):
                     raise RuntimeError("파일 크기 또는 수정 시각이 쓰기 직전 변경됨")
                 code, output, warning = write_metadata(
-                    exiftool, path, planned, no_backup
+                    exiftool, path, planned, no_backup, session
                 )
                 restore_access_and_modify_times(path, before)
                 if code:
                     raise RuntimeError(warning or output or f"ExifTool 쓰기 종료 코드 {code}")
-                verified_metadata = read_metadata(exiftool, path, video)
+                verified_metadata = read_metadata(exiftool, path, video, session)
                 restore_access_and_modify_times(path, before)
                 final_details = path.stat()
                 verify_state, verify_detail = metadata_state(
