@@ -18,7 +18,6 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-KST = timezone(timedelta(hours=9), "KST")
 UTC = timezone.utc
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".mp4", ".mov"}
 VIDEO_EXTENSIONS = {".mp4", ".mov"}
@@ -54,7 +53,7 @@ CSV_FIELDS = (
     "pattern",
     "timestamp_ms",
     "target_datetime_utc",
-    "target_datetime_kst",
+    "target_datetime_local",
     "existing_metadata",
     "planned_tags",
     "action",
@@ -143,7 +142,12 @@ def timestamp_datetimes(timestamp_ms):
     utc = datetime.fromtimestamp(seconds, tz=UTC).replace(
         microsecond=milliseconds * 1000
     )
-    return utc, utc.astimezone(KST)
+    return utc, utc.astimezone()
+
+
+def offset_text(value):
+    compact = value.strftime("%z")
+    return f"{compact[:3]}:{compact[3:]}"
 
 
 def exif_datetime(value, assume_tz=None):
@@ -174,11 +178,12 @@ def exif_datetime(value, assume_tz=None):
         return None
 
 
-def target_tags(extension, utc, kst):
-    milliseconds = kst.microsecond // 1000
-    local_seconds = kst.strftime("%Y:%m:%d %H:%M:%S")
-    local_offset = local_seconds + "+09:00"
-    local_precise = f"{local_seconds}.{milliseconds:03d}+09:00"
+def target_tags(extension, utc, local):
+    milliseconds = local.microsecond // 1000
+    local_seconds = local.strftime("%Y:%m:%d %H:%M:%S")
+    offset = offset_text(local)
+    local_with_offset = local_seconds + offset
+    local_precise = f"{local_seconds}.{milliseconds:03d}{offset}"
     utc_seconds = utc.strftime("%Y:%m:%d %H:%M:%S")
     if extension in {".jpg", ".jpeg"}:
         values = {
@@ -188,14 +193,14 @@ def target_tags(extension, utc, kst):
             "SubSecTimeOriginal": f"{milliseconds:03d}",
             "SubSecTimeDigitized": f"{milliseconds:03d}",
             "SubSecTime": f"{milliseconds:03d}",
-            "OffsetTimeOriginal": "+09:00",
-            "OffsetTimeDigitized": "+09:00",
-            "OffsetTime": "+09:00",
+            "OffsetTimeOriginal": offset,
+            "OffsetTimeDigitized": offset,
+            "OffsetTime": offset,
         }
         return {tag: values[tag.split(":", 1)[1]] for tag in JPEG_TAGS}
     if extension == ".png":
         values = {
-            "PNG:CreationTime": local_offset,
+            "PNG:CreationTime": local_with_offset,
             "XMP-exif:DateTimeOriginal": local_precise,
             "XMP-xmp:CreateDate": local_precise,
             "XMP-xmp:ModifyDate": local_precise,
@@ -206,6 +211,15 @@ def target_tags(extension, utc, kst):
 
 def decode_output(data):
     return data.decode("utf-8", errors="replace").strip()
+
+
+def exiftool_environment():
+    if os.name != "nt":
+        return None
+    environment = os.environ.copy()
+    for name in ("LANG", "LC_ALL", "LC_CTYPE"):
+        environment.pop(name, None)
+    return environment
 
 
 def run_exiftool(executable, arguments):
@@ -219,6 +233,7 @@ def run_exiftool(executable, arguments):
             stderr=subprocess.PIPE,
             shell=False,
             check=False,
+            env=exiftool_environment(),
         )
     except OSError as error:
         raise RuntimeError(f"ExifTool 실행 실패: {error}") from error
@@ -235,6 +250,7 @@ def exiftool_version(executable):
             stderr=subprocess.PIPE,
             shell=False,
             check=False,
+            env=exiftool_environment(),
         )
     except OSError as error:
         raise RuntimeError(f"ExifTool을 찾거나 실행할 수 없습니다: {error}") from error
@@ -288,11 +304,13 @@ def target_entries(metadata, extension):
                 continue
             if name not in allowed:
                 continue
+            if str(value) == "0000:00:00 00:00:00":
+                continue
         entries.append((key, name, str(value)))
     return entries
 
 
-def metadata_state(metadata, extension, planned, utc, kst):
+def metadata_state(metadata, extension, planned, utc, local):
     entries = target_entries(metadata, extension)
     found_names = {name for _, name, _ in entries}
     planned_names = {tag.split(":", 1)[1] for tag in planned}
@@ -309,14 +327,14 @@ def metadata_state(metadata, extension, planned, utc, kst):
             if normalized != utc.replace(microsecond=0):
                 conflicts.append(f"{key}={value!r}")
         elif name.startswith("SubSecTime"):
-            expected = f"{kst.microsecond // 1000:03d}"
+            expected = f"{local.microsecond // 1000:03d}"
             if value != expected:
                 conflicts.append(f"{key}={value!r}")
         elif name.startswith("OffsetTime"):
-            if value != "+09:00":
+            if value != offset_text(local):
                 conflicts.append(f"{key}={value!r}")
         else:
-            parsed = exif_datetime(value, KST)
+            parsed = exif_datetime(value, local.tzinfo)
             if not parsed or parsed.astimezone(UTC).replace(microsecond=0) != utc.replace(
                 microsecond=0
             ):
@@ -447,20 +465,45 @@ def run_self_test():
     for filename in rejected:
         assert match_filename(filename) is None, filename
     assert match_filename("LINE_MOVIE_1545316978976.jpg")["supported"] is False
-    expected = {
-        "1579242283509": "2020-01-17 15:24:43.509",
-        "1545316978976": "2018-12-20 23:42:58.976",
-        "1572348095097": "2019-10-29 20:21:35.097",
-        "1720495695578": "2024-07-09 12:28:15.578",
+    expected_utc = {
+        "1579242283509": "2020-01-17 06:24:43.509",
+        "1545316978976": "2018-12-20 14:42:58.976",
+        "1572348095097": "2019-10-29 11:21:35.097",
+        "1720495695578": "2024-07-09 03:28:15.578",
     }
-    for value, text in expected.items():
-        _, kst = timestamp_datetimes(value)
-        actual = kst.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    for value, text in expected_utc.items():
+        utc, local = timestamp_datetimes(value)
+        actual = utc.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         assert actual == text, (value, actual, text)
+        assert local.astimezone(UTC) == utc
+    sample_utc, _ = timestamp_datetimes("1579242283509")
+    sample_local = sample_utc.astimezone(timezone(timedelta(hours=-4)))
+    jpeg = target_tags(".jpg", sample_utc, sample_local)
+    png = target_tags(".png", sample_utc, sample_local)
+    video = target_tags(".mp4", sample_utc, sample_local)
+    assert offset_text(sample_utc) == "+00:00"
+    assert jpeg["EXIF:OffsetTimeOriginal"] == "-04:00"
+    assert png["PNG:CreationTime"].endswith("-04:00")
+    assert set(video.values()) == {sample_utc.strftime("%Y:%m:%d %H:%M:%S")}
+    assert (
+        metadata_state(jpeg, ".jpg", jpeg, sample_utc, sample_local)[0]
+        == "ALREADY_CORRECT"
+    )
+    empty_video = {tag: "0000:00:00 00:00:00" for tag in VIDEO_TAGS}
+    assert (
+        metadata_state(empty_video, ".mp4", video, sample_utc, sample_local)[0]
+        == "WRITE"
+    )
+    if os.name == "nt":
+        assert not {"LANG", "LC_ALL", "LC_CTYPE"} & exiftool_environment().keys()
     print("SELF_TEST PASSED")
 
 
-def print_summary(stats):
+def console_emit(message, error=False):
+    print(message, file=sys.stderr if error else sys.stdout)
+
+
+def print_summary(stats, emit=console_emit):
     labels = (
         ("Total scanned", "total"),
         ("Matched", "matched"),
@@ -474,39 +517,52 @@ def print_summary(stats):
         ("Not local or unreadable", "not_local"),
         ("Failed", "failed"),
         ("Verification failed", "verify_failed"),
+        ("Cancelled", "cancelled"),
     )
-    print("\nSummary")
+    emit("\nSummary")
     for label, key in labels:
-        print(f"{label}: {stats[key]}")
-    print("Patterns")
+        emit(f"{label}: {stats[key]}")
+    emit("Patterns")
     for pattern in ("numeric_timestamp", "line_movie", "kakaotalk"):
-        print(f"{pattern}: {stats['patterns'][pattern]}")
+        emit(f"{pattern}: {stats['patterns'][pattern]}")
 
 
-def main():
-    args = parse_args()
-    if args.self_test:
-        run_self_test()
-        return 0
-
-    root = Path(os.path.abspath(args.root))
+def process_media(
+    root,
+    *,
+    apply_changes=False,
+    overwrite_existing=False,
+    no_backup=False,
+    log_all_skips=False,
+    exiftool="exiftool",
+    log_dir=None,
+    emit=console_emit,
+    on_progress=None,
+    should_stop=None,
+):
+    root = Path(os.path.abspath(root))
     if not root.exists() or not root.is_dir():
-        print(f"ERROR: 루트 폴더가 없거나 디렉터리가 아닙니다: {root}", file=sys.stderr)
-        return 2
+        emit(f"ERROR: 루트 폴더가 없거나 디렉터리가 아닙니다: {root}", error=True)
+        return 2, None, None
     root_details = root.stat()
     if getattr(root_details, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT:
-        print(f"ERROR: 루트가 재분석 지점입니다: {root}", file=sys.stderr)
-        return 2
+        emit(f"ERROR: 루트가 재분석 지점입니다: {root}", error=True)
+        return 2, None, None
     try:
-        version = exiftool_version(args.exiftool)
+        version = exiftool_version(exiftool)
     except RuntimeError as error:
-        print(f"ERROR: {error}", file=sys.stderr)
-        return 2
+        emit(f"ERROR: {error}", error=True)
+        return 2, None, None
 
-    apply_changes = args.apply
-    upper_bound = datetime.now(KST) + timedelta(days=1)
-    lower_bound = datetime(2000, 1, 1, tzinfo=KST)
-    log_path = Path.cwd() / datetime.now().strftime(
+    upper_bound = datetime.now(UTC) + timedelta(days=1)
+    lower_bound = datetime(2000, 1, 1, tzinfo=UTC)
+    log_dir = Path(log_dir) if log_dir else Path.cwd()
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        emit(f"ERROR: 로그 폴더 생성 실패: {error}", error=True)
+        return 2, None, None
+    log_path = log_dir / datetime.now().strftime(
         "fix_media_dates_%Y%m%d_%H%M%S_%f.csv"
     )
     stats = {
@@ -522,24 +578,49 @@ def main():
         "not_local": 0,
         "failed": 0,
         "verify_failed": 0,
+        "cancelled": 0,
         "patterns": {"numeric_timestamp": 0, "line_movie": 0, "kakaotalk": 0},
     }
 
-    print(f"ExifTool: {version}")
-    print(f"Mode: {'APPLY' if apply_changes else 'DRY-RUN'}")
-    print(f"Root: {root}")
-    print(f"CSV: {log_path}")
-    print("주의: 전체 적용 전 OneDrive 동기화를 일시 중지하고 테스트 복사본으로 검증하세요.")
+    emit(f"ExifTool: {version}")
+    emit(f"Mode: {'APPLY' if apply_changes else 'DRY-RUN'}")
+    emit(f"Root: {root}")
+    emit(f"CSV: {log_path}")
+    emit("주의: 전체 적용 전 OneDrive 동기화를 일시 중지하고 테스트 복사본으로 검증하세요.")
     if apply_changes:
-        print(
+        emit(
             "Windows 생성 시각은 ExifTool -P와 설치된 Win32 API 지원에 의존하며, "
             "각 파일에서 적용 전후 값을 확인합니다. 확인할 수 없으면 수정하지 않습니다."
         )
 
+    if on_progress or should_stop:
+        files = []
+        if on_progress:
+            on_progress(0, None, "파일 목록 확인 중")
+        for item in scan_files(root):
+            if should_stop and should_stop():
+                stats["cancelled"] = 1
+                files.clear()
+                break
+            files.append(item)
+            if on_progress and len(files) % 100 == 0:
+                on_progress(len(files), None, "파일 목록 확인 중")
+        total_files = len(files)
+    else:
+        files = scan_files(root)
+        total_files = None
+
+    processed = 0
     with log_path.open("x", encoding="utf-8-sig", newline="") as log_file:
         writer = csv.DictWriter(log_file, fieldnames=CSV_FIELDS)
         writer.writeheader()
-        for path, scanned_details, scan_error in scan_files(root):
+        for index, (path, scanned_details, scan_error) in enumerate(files, 1):
+            if should_stop and should_stop():
+                stats["cancelled"] = 1
+                break
+            processed = index
+            if on_progress:
+                on_progress(index, total_files, path.name)
             row = blank_row(path)
             if scanned_details is None:
                 stats["failed"] += 1
@@ -550,14 +631,14 @@ def main():
             stats["total"] += 1
             if is_temporary_or_backup(path.name):
                 stats["pattern_mismatch"] += 1
-                if args.log_all_skips:
+                if log_all_skips:
                     record_skip(writer, row, "SKIPPED", "TEMP_OR_BACKUP")
                 continue
 
             match = match_filename(path.name)
             if not match:
                 stats["pattern_mismatch"] += 1
-                if args.log_all_skips:
+                if log_all_skips:
                     record_skip(writer, row, "SKIPPED", "PATTERN_MISMATCH")
                 continue
 
@@ -567,7 +648,7 @@ def main():
                 pattern=match["pattern"],
                 timestamp_ms=match["timestamp_ms"],
                 precision="seconds" if match["extension"] in VIDEO_EXTENSIONS else "milliseconds",
-                backup_expected="no" if args.no_backup else "yes",
+                backup_expected="no" if no_backup else "yes",
             )
             if not match["supported"]:
                 stats["unsupported"] += 1
@@ -585,27 +666,27 @@ def main():
                 continue
 
             try:
-                utc, kst = timestamp_datetimes(match["timestamp_ms"])
+                utc, local = timestamp_datetimes(match["timestamp_ms"])
             except (OverflowError, OSError, ValueError) as error:
                 stats["out_of_range"] += 1
                 record_skip(writer, row, "OUT_OF_RANGE", str(error))
                 continue
             row.update(
                 target_datetime_utc=utc.isoformat(timespec="milliseconds"),
-                target_datetime_kst=kst.isoformat(timespec="milliseconds"),
+                target_datetime_local=local.isoformat(timespec="milliseconds"),
             )
-            if not (lower_bound <= kst <= upper_bound):
+            if not (lower_bound <= utc <= upper_bound):
                 stats["out_of_range"] += 1
                 record_skip(writer, row, "OUT_OF_RANGE")
                 continue
 
-            planned = target_tags(match["extension"], utc, kst)
+            planned = target_tags(match["extension"], utc, local)
             row["planned_tags"] = compact_json(planned)
             video = match["extension"] in VIDEO_EXTENSIONS
             try:
                 before = path.stat()
                 try:
-                    metadata = read_metadata(args.exiftool, path, video)
+                    metadata = read_metadata(exiftool, path, video)
                 finally:
                     restore_access_and_modify_times(path, before)
                 after_read = path.stat()
@@ -626,13 +707,13 @@ def main():
                 continue
 
             state, detail = metadata_state(
-                metadata, match["extension"], planned, utc, kst
+                metadata, match["extension"], planned, utc, local
             )
             if state == "ALREADY_CORRECT":
                 stats["already"] += 1
                 record_skip(writer, row, "ALREADY_CORRECT")
                 continue
-            if state == "CONFLICT" and not args.overwrite_existing:
+            if state == "CONFLICT" and not overwrite_existing:
                 stats["conflicts"] += 1
                 record_skip(writer, row, "CONFLICT", detail)
                 continue
@@ -658,7 +739,7 @@ def main():
                 writer.writerow(row)
                 continue
             backup_path = Path(str(path) + "_original")
-            if not args.no_backup and backup_path.exists():
+            if not no_backup and backup_path.exists():
                 stats["failed"] += 1
                 row.update(
                     action="SKIPPED",
@@ -672,16 +753,16 @@ def main():
                 if not same_source_state(before, current):
                     raise RuntimeError("파일 크기 또는 수정 시각이 쓰기 직전 변경됨")
                 code, output, warning = write_metadata(
-                    args.exiftool, path, planned, args.no_backup
+                    exiftool, path, planned, no_backup
                 )
                 restore_access_and_modify_times(path, before)
                 if code:
                     raise RuntimeError(warning or output or f"ExifTool 쓰기 종료 코드 {code}")
-                verified_metadata = read_metadata(args.exiftool, path, video)
+                verified_metadata = read_metadata(exiftool, path, video)
                 restore_access_and_modify_times(path, before)
                 final_details = path.stat()
                 verify_state, verify_detail = metadata_state(
-                    verified_metadata, match["extension"], planned, utc, kst
+                    verified_metadata, match["extension"], planned, utc, local
                 )
                 final_system_times = system_times(verified_metadata)
                 verification_errors = []
@@ -698,7 +779,7 @@ def main():
                         "파일 시스템 생성/수정 시각 보존 실패: "
                         f"{original_system_times!r} -> {final_system_times!r}"
                     )
-                if not args.no_backup and not backup_path.exists():
+                if not no_backup and not backup_path.exists():
                     verification_errors.append("예상한 _original 백업이 생성되지 않음")
                 if warning:
                     row["error"] = f"ExifTool warning: {warning}"
@@ -710,7 +791,7 @@ def main():
                         error="; ".join(
                             ([row["error"]] if row["error"] else []) + verification_errors
                         )
-                        + (f"; 백업 확인: {backup_path}" if not args.no_backup else ""),
+                        + (f"; 백업 확인: {backup_path}" if not no_backup else ""),
                     )
                 else:
                     stats["modified"] += 1
@@ -725,9 +806,34 @@ def main():
                 row.update(action="MODIFIED", result="FAILED", error=str(error))
             writer.writerow(row)
 
-    print_summary(stats)
-    print(f"CSV log: {log_path}")
-    return 1 if stats["failed"] or stats["verify_failed"] else 0
+    if on_progress:
+        on_progress(processed, total_files, "중단됨" if stats["cancelled"] else "완료")
+    if stats["cancelled"]:
+        emit("취소 요청에 따라 파일 사이에서 안전하게 중단했습니다.")
+    print_summary(stats, emit)
+    emit(f"CSV log: {log_path}")
+    code = (
+        130
+        if stats["cancelled"]
+        else 1 if stats["failed"] or stats["verify_failed"] else 0
+    )
+    return code, stats, log_path
+
+
+def main():
+    args = parse_args()
+    if args.self_test:
+        run_self_test()
+        return 0
+    code, _, _ = process_media(
+        args.root,
+        apply_changes=args.apply,
+        overwrite_existing=args.overwrite_existing,
+        no_backup=args.no_backup,
+        log_all_skips=args.log_all_skips,
+        exiftool=args.exiftool,
+    )
+    return code
 
 
 if __name__ == "__main__":

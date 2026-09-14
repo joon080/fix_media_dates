@@ -1,0 +1,7 @@
+__pycache__/
+build/
+dist/
+*.spec
+exiftool-*/
+media date fixer/
+media date fixer.zip
