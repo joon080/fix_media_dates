@@ -44,12 +44,17 @@ Dry Run은 선택 사항이지만 많은 파일에 처음 적용할 때는 먼�
 | `{timestamp_ms}` | JPG, JPEG, PNG, MP4, MOV | `1579242283509.jpg` |
 | `LINE_MOVIE_{timestamp_ms}` | MP4, MOV | `LINE_MOVIE_1545316978976.mp4` |
 | `kakaotalk_{timestamp_ms}` | MP4, MOV | `KakaoTalk_1572348095097.MOV` |
+| `YYYY_MM_DD HH_MM` | MP4, MOV | `2025_06_13 22_12.mp4` |
+| `YYYY_MM_DD HH_MM (복사본 번호)` | MP4, MOV | `2023_08_04 13_16 (1).mp4` |
+| `VID_YYYYMMDD_HHMMSS_mmm` | MP4, MOV | `VID_20251001_232540_472.mp4` |
+| `YYYYMMDD_HHMMSS` | MP4, MOV | `20250228_172309.mp4` |
 
 다른 문자열이 앞뒤에 붙거나 타임스탬프 자릿수가 다르면 처리하지 않습니다.
 
 ## 날짜 처리 방식
 
 - 파일명의 Unix timestamp는 항상 UTC 기준으로 해석합니다.
+- 날짜와 시각이 직접 적힌 동영상 파일명은 Windows 시스템 현지 시각으로 해석한 뒤 UTC로 변환합니다.
 - JPG/JPEG와 PNG에는 해당 날짜의 Windows 시스템 현지 시각과 UTC 오프셋을 기록합니다.
 - MP4와 MOV의 QuickTime 날짜에는 UTC를 기록합니다.
 - 사진은 밀리초, 동영상은 초 단위까지 기록합니다.

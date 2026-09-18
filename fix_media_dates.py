@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Restore media capture dates from strictly validated millisecond timestamps."""
+"""Restore media capture dates from strictly validated filename dates."""
 
 import argparse
 import csv
@@ -23,6 +23,15 @@ if hasattr(sys.stdout, "reconfigure"):
 UTC = timezone.utc
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".mp4", ".mov"}
 VIDEO_EXTENSIONS = {".mp4", ".mov"}
+PATTERN_NAMES = (
+    "numeric_timestamp",
+    "line_movie",
+    "kakaotalk",
+    "video_local_minute",
+    "vid_local_millisecond",
+    "video_local_second",
+)
+VIDEO_ONLY_PATTERNS = set(PATTERN_NAMES) - {"numeric_timestamp"}
 JPEG_TAGS = (
     "EXIF:DateTimeOriginal",
     "EXIF:CreateDate",
@@ -81,7 +90,7 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "검증된 파일명의 Unix timestamp(ms)로 사진/동영상 날짜 메타데이터를 복구합니다. "
+            "검증된 파일명의 날짜 또는 Unix timestamp(ms)로 사진/동영상 날짜 메타데이터를 복구합니다. "
             "기본 동작은 dry-run입니다. PNG 날짜 표시 여부는 프로그램마다 다를 수 있습니다."
         ),
         epilog=(
@@ -112,25 +121,54 @@ def parse_args():
     return args
 
 
+def local_datetime_timestamp_ms(value, date_format):
+    try:
+        local = datetime.strptime(value, date_format).astimezone()
+        return str(round(local.timestamp() * 1000))
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
 def match_filename(filename):
     path = Path(filename)
     stem, extension = path.stem, path.suffix.lower()
-    match = re.fullmatch(r"[0-9]{13}", stem, re.ASCII)
-    if match:
-        pattern, timestamp_ms = "numeric_timestamp", stem
-    else:
-        match = re.fullmatch(r"LINE_MOVIE_([0-9]{13})", stem, re.ASCII)
+    for pattern, expression, flags in (
+        ("numeric_timestamp", r"([0-9]{13})", re.ASCII),
+        ("line_movie", r"LINE_MOVIE_([0-9]{13})", re.ASCII),
+        ("kakaotalk", r"kakaotalk_([0-9]{13})", re.ASCII | re.IGNORECASE),
+    ):
+        match = re.fullmatch(expression, stem, flags)
         if match:
-            pattern, timestamp_ms = "line_movie", match.group(1)
+            timestamp_ms = match.group(1)
+            break
+    else:
+        for pattern, expression, date_format in (
+            (
+                "video_local_minute",
+                r"([0-9]{4}_[0-9]{2}_[0-9]{2} [0-9]{2}_[0-9]{2})(?: \([0-9]+\))?",
+                "%Y_%m_%d %H_%M",
+            ),
+            (
+                "vid_local_millisecond",
+                r"VID_([0-9]{8}_[0-9]{6}_[0-9]{3})",
+                "%Y%m%d_%H%M%S_%f",
+            ),
+            (
+                "video_local_second",
+                r"([0-9]{8}_[0-9]{6})",
+                "%Y%m%d_%H%M%S",
+            ),
+        ):
+            match = re.fullmatch(expression, stem, re.ASCII)
+            if match:
+                timestamp_ms = local_datetime_timestamp_ms(match.group(1), date_format)
+                if timestamp_ms is None:
+                    return None
+                break
         else:
-            match = re.fullmatch(
-                r"kakaotalk_([0-9]{13})", stem, re.ASCII | re.IGNORECASE
-            )
-            if not match:
-                return None
-            pattern, timestamp_ms = "kakaotalk", match.group(1)
+            return None
     supported = extension in SUPPORTED_EXTENSIONS
-    if pattern in {"line_movie", "kakaotalk"} and extension not in VIDEO_EXTENSIONS:
+    if pattern in VIDEO_ONLY_PATTERNS and extension not in VIDEO_EXTENSIONS:
         supported = False
     return {
         "pattern": pattern,
@@ -549,18 +587,26 @@ def run_self_test():
         "1579242283509.jpg": "numeric_timestamp",
         "1720495695578.png": "numeric_timestamp",
         "LINE_MOVIE_1545316978976.mp4": "line_movie",
+        "LINE_MOVIE_1545649197800.mp4": "line_movie",
         "kakaotalk_1572348095097.mp4": "kakaotalk",
         "KakaoTalk_1572348095097.MOV": "kakaotalk",
+        "2025_06_13 22_12.mp4": "video_local_minute",
+        "VID_20251001_232540_472.mp4": "vid_local_millisecond",
+        "2023_08_04 13_16 (1).mp4": "video_local_minute",
+        "20250228_172309.mp4": "video_local_second",
     }
     rejected = (
         "EYS7454015450431906237.mp4",
-        "VID_23590721_204419_081.mp4",
         "IMG_1579242283509.jpg",
         "1579242283509_1.jpg",
         "LINE_MOVIE_1545316978976_1.mp4",
         "my_kakaotalk_1572348095097.mp4",
         "123456789012.jpg",
         "12345678901234.jpg",
+        "2025_02_30 22_12.mp4",
+        "VID_20251001_252540_472.mp4",
+        "2023_08_04 13_16 (x).mp4",
+        "20250228_172309_1.mp4",
     )
     for filename, pattern in accepted.items():
         match = match_filename(filename)
@@ -568,9 +614,15 @@ def run_self_test():
     for filename in rejected:
         assert match_filename(filename) is None, filename
     assert match_filename("LINE_MOVIE_1545316978976.jpg")["supported"] is False
+    assert match_filename("20250228_172309.jpg")["supported"] is False
+    future = match_filename("VID_23590721_204419_081.mp4")
+    assert timestamp_datetimes(future["timestamp_ms"])[0] > datetime.now(UTC) + timedelta(
+        days=1
+    )
     expected_utc = {
         "1579242283509": "2020-01-17 06:24:43.509",
         "1545316978976": "2018-12-20 14:42:58.976",
+        "1545649197800": "2018-12-24 10:59:57.800",
         "1572348095097": "2019-10-29 11:21:35.097",
         "1720495695578": "2024-07-09 03:28:15.578",
     }
@@ -578,6 +630,18 @@ def run_self_test():
         utc, local = timestamp_datetimes(value)
         actual = utc.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         assert actual == text, (value, actual, text)
+        assert local.astimezone(UTC) == utc
+    expected_local = {
+        "2025_06_13 22_12.mp4": "2025-06-13 22:12:00.000",
+        "VID_20251001_232540_472.mp4": "2025-10-01 23:25:40.472",
+        "2023_08_04 13_16 (1).mp4": "2023-08-04 13:16:00.000",
+        "20250228_172309.mp4": "2025-02-28 17:23:09.000",
+    }
+    for filename, text in expected_local.items():
+        match = match_filename(filename)
+        utc, local = timestamp_datetimes(match["timestamp_ms"])
+        actual = local.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        assert actual == text, (filename, actual, text)
         assert local.astimezone(UTC) == utc
     sample_utc, _ = timestamp_datetimes("1579242283509")
     sample_local = sample_utc.astimezone(timezone(timedelta(hours=-4)))
@@ -626,7 +690,7 @@ def print_summary(stats, emit=console_emit):
     for label, key in labels:
         emit(f"{label}: {stats[key]}")
     emit("Patterns")
-    for pattern in ("numeric_timestamp", "line_movie", "kakaotalk"):
+    for pattern in PATTERN_NAMES:
         emit(f"{pattern}: {stats['patterns'][pattern]}")
 
 
@@ -685,7 +749,7 @@ def process_media(
         "failed": 0,
         "verify_failed": 0,
         "cancelled": 0,
-        "patterns": {"numeric_timestamp": 0, "line_movie": 0, "kakaotalk": 0},
+        "patterns": {pattern: 0 for pattern in PATTERN_NAMES},
     }
 
     emit(f"ExifTool: {version}")
