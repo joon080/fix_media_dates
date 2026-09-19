@@ -312,7 +312,7 @@ class MediaDateFixerApp:
         cards.grid(row=1, column=0, sticky="ew", pady=(8, 14))
         for column in range(4):
             cards.columnconfigure(column, weight=1)
-        for column, label in enumerate(("대상", "충돌", "수정 완료", "건너뜀")):
+        for column, label in enumerate(("대상", "충돌", "수정 완료", "전체")):
             self._summary_card(cards, column, label, self.summary[column])
 
         ttk.Label(content, text="로그", style="Section.TLabel").grid(
@@ -488,10 +488,15 @@ class MediaDateFixerApp:
         elif code == 0:
             self.status.set("완료")
             self.percent.set("100%")
+        elif stats is not None:
+            error_count = stats["failed"] + stats["verify_failed"]
+            self.status.set(f"완료 ({error_count:,}개 오류)")
+            self.percent.set("100%")
+            if self.errors:
+                messagebox.showerror(APP_TITLE, self.errors[-1])
         else:
             self.status.set("오류")
-            if stats is None:
-                self.percent.set("0%")
+            self.percent.set("0%")
             if self.errors:
                 messagebox.showerror(APP_TITLE, self.errors[-1])
         self._set_busy(False)
@@ -578,6 +583,11 @@ def run_self_test():
         assert tuple(app.workers_box.cget("values")) == ("1개", "2개", "4개")
         app.overwrite_button.invoke()
         assert app.overwrite.get()
+        app._show_log = lambda path: None
+        app._set_busy = lambda busy: None
+        app._finish(1, stats | {"failed": 2, "verify_failed": 1}, None)
+        assert app.percent.get() == "100%"
+        assert app.status.get() == "완료 (3개 오류)"
     finally:
         root.destroy()
     print("GUI SELF_TEST PASSED")
