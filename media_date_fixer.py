@@ -251,7 +251,7 @@ class MediaDateFixerApp:
         self.dry_run_button.pack(side="left", ipadx=20)
         self.apply_button = ttk.Button(
             actions,
-            text="실제 적용",
+            text="실행",
             style="Accent.TButton",
             command=lambda: self._run(True),
         )
