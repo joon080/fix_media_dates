@@ -70,14 +70,9 @@ class JpegRepairTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 core._validate_jpeg_bytes(str(self.exiftool), original)
 
-            with patch.object(
-                core,
-                "_current_repair_kind",
-                return_value=core.REPAIR_KIND_JPEG_OTHER_IMAGE_START,
-            ):
-                result = core.repair_jpeg_other_image(
-                    root, self.row(path), exiftool=str(self.exiftool)
-                )
+            result = core.repair_jpeg_other_image(
+                root, self.row(path), exiftool=str(self.exiftool)
+            )
 
             self.assertEqual(result["result"], "REPAIRED", result["error"])
             repaired = path.read_bytes()
@@ -92,6 +87,34 @@ class JpegRepairTest(unittest.TestCase):
                 "ALREADY_CORRECT",
             )
             self.assertEqual(Path(str(path) + "_original").read_bytes(), original)
+
+    def test_initial_apply_failure_is_classified_for_repair(self):
+        with tempfile.TemporaryDirectory(dir="build") as temporary:
+            root = Path(temporary).resolve()
+            path = root / "1579242283509.jpg"
+            original = self.damaged_jpeg(path)
+            session = core.ExifToolSession(str(self.exiftool))
+            try:
+                result = core._process_file(
+                    (path, path.stat(), "", core.match_filename(path.name)),
+                    session=session,
+                    exiftool=str(self.exiftool),
+                    apply_changes=True,
+                    overwrite_existing=False,
+                    no_backup=True,
+                    log_all_skips=False,
+                    lower_bound=core.datetime(2000, 1, 1, tzinfo=core.UTC),
+                    upper_bound=core.datetime.now(core.UTC) + core.timedelta(days=1),
+                )
+            finally:
+                session.close()
+            row = result[0]
+            self.assertEqual((row["action"], row["result"]), ("SKIPPED", "FAILED"))
+            self.assertEqual(
+                core.classify_repair_kind(row),
+                core.REPAIR_KIND_JPEG_OTHER_IMAGE_START,
+            )
+            self.assertEqual(path.read_bytes(), original)
 
     def test_conflict_is_preserved_without_permanent_backup(self):
         with tempfile.TemporaryDirectory(dir="build") as temporary:

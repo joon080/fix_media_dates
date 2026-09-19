@@ -761,11 +761,15 @@ def _write_jpeg_dates(executable, data, planned):
 
 
 def _current_repair_kind(executable, path, row):
-    code, output, error = run_exiftool(
-        executable, ["-j", "-a", "-G1", "-s", "-time:all", str(path)]
-    )
+    match = match_filename(path.name)
+    if not match:
+        return ""
+    utc, local = timestamp_datetimes(match["timestamp_ms"])
+    planned = target_tags(match["extension"], utc, local)
+    arguments = ["-P", *(f"-{tag}={value}" for tag, value in planned.items()), "-o", "-"]
+    _, _, error = _run_exiftool_bytes(executable, arguments, path.read_bytes())
     probe = dict(row)
-    probe["error"] = error or (output if code else "")
+    probe["error"] = error
     return classify_repair_kind(probe)
 
 
@@ -1373,7 +1377,13 @@ def _process_file(
         except OSError as restore_error:
             error = RuntimeError(f"{error}; 파일 시각 복원 실패: {restore_error}")
         count("failed")
-        row.update(action="MODIFIED", result="FAILED", error=str(error))
+        row.update(action="SKIPPED", result="FAILED", error=str(error))
+        try:
+            unchanged = path.exists() and same_source_state(before, path.stat())
+        except OSError:
+            unchanged = False
+        if not unchanged or not classify_repair_kind(row):
+            row["action"] = "MODIFIED"
     return row, counts, session_broken
 
 
