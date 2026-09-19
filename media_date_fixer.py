@@ -122,6 +122,8 @@ class MediaDateFixerApp:
         self.folder = tk.StringVar()
         self.overwrite = tk.BooleanVar(value=False)
         self.backup = tk.BooleanVar(value=True)
+        self.workers = tk.StringVar(value="2개")
+        self.active_workers = 1
         self.status = tk.StringVar(value="대기 중")
         self.percent = tk.StringVar(value="0%")
         self.summary = [tk.StringVar(value="0") for _ in range(4)]
@@ -272,6 +274,15 @@ class MediaDateFixerApp:
             compound="left",
         )
         self.backup_button.pack(side="left")
+        ttk.Label(actions, text="적용 동시 처리").pack(side="left", padx=(20, 8))
+        self.workers_box = ttk.Combobox(
+            actions,
+            textvariable=self.workers,
+            values=("1개", "2개", "4개"),
+            width=4,
+            state="readonly",
+        )
+        self.workers_box.pack(side="left")
 
         progress_header = ttk.Frame(main)
         progress_header.grid(row=5, column=0, columnspan=3, sticky="ew")
@@ -381,9 +392,11 @@ class MediaDateFixerApp:
         except FileNotFoundError as error:
             messagebox.showerror(APP_TITLE, str(error))
             return
+        workers = int(self.workers.get()[0]) if apply_changes else 1
         if apply_changes and not messagebox.askyesno(
             APP_TITLE,
-            "선택한 폴더의 메타데이터를 실제로 수정하시겠습니까?",
+            "선택한 폴더의 메타데이터를 실제로 수정하시겠습니까?\n"
+            f"동시 처리: {workers}개",
         ):
             return
 
@@ -393,7 +406,9 @@ class MediaDateFixerApp:
             "no_backup": not self.backup.get(),
             "exiftool": str(exiftool),
             "log_dir": log_directory(),
+            "workers": workers,
         }
+        self.active_workers = workers
         self.cancel_event.clear()
         self.errors.clear()
         self.close_when_done = False
@@ -491,13 +506,16 @@ class MediaDateFixerApp:
         self.browse_button.configure(state=state)
         self.overwrite_button.configure(state=state)
         self.backup_button.configure(state=state)
+        self.workers_box.configure(state="disabled" if busy else "readonly")
         self.cancel_button.configure(state="normal" if busy else "disabled")
 
     def _cancel(self):
         if self.busy and not self.cancel_event.is_set():
             self.cancel_event.set()
             self.cancel_button.configure(state="disabled")
-            self.status.set("중단 요청됨 (현재 파일 완료 후)")
+            self.status.set(
+                f"중단 요청됨 (처리 중인 파일 최대 {self.active_workers}개 완료 후)"
+            )
 
     def _close(self):
         if not self.busy:
@@ -505,7 +523,8 @@ class MediaDateFixerApp:
             return
         if messagebox.askyesno(
             APP_TITLE,
-            "현재 파일 처리가 끝난 뒤 중단하고 창을 닫으시겠습니까?",
+            f"처리 중인 파일 최대 {self.active_workers}개가 끝난 뒤 "
+            "중단하고 창을 닫으시겠습니까?",
         ):
             self.close_when_done = True
             self._cancel()
@@ -555,6 +574,8 @@ def run_self_test():
         assert "indicator" not in str(ttk.Style(root).layout("Green.TCheckbutton"))
         assert app.checkbox_on.get(10, 6) == (16, 124, 16)
         assert app.checkbox_off.get(10, 6) == (255, 255, 255)
+        assert app.workers.get() == "2개"
+        assert tuple(app.workers_box.cget("values")) == ("1개", "2개", "4개")
         app.overwrite_button.invoke()
         assert app.overwrite.get()
     finally:

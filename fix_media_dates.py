@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import ctypes
 import json
 import os
 import queue
@@ -11,8 +12,12 @@ import stat
 import subprocess
 import sys
 import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+if os.name == "nt":
+    from ctypes import wintypes
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -85,6 +90,32 @@ PLACEHOLDER_FLAGS = (
     | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
 )
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+WINDOWS_EPOCH_100NS = 116444736000000000
+if os.name == "nt":
+    KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    CREATE_FILE = KERNEL32.CreateFileW
+    CREATE_FILE.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    CREATE_FILE.restype = wintypes.HANDLE
+    SET_FILE_TIME = KERNEL32.SetFileTime
+    SET_FILE_TIME.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    )
+    SET_FILE_TIME.restype = wintypes.BOOL
+    CLOSE_HANDLE = KERNEL32.CloseHandle
+    CLOSE_HANDLE.argtypes = (wintypes.HANDLE,)
+    CLOSE_HANDLE.restype = wintypes.BOOL
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 
 def parse_args():
@@ -114,10 +145,21 @@ def parse_args():
     )
     parser.add_argument("--log-all-skips", action="store_true", help="패턴 불일치도 CSV에 기록")
     parser.add_argument("--exiftool", default="exiftool", help="ExifTool 실행 파일 경로")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        choices=(1, 2, 4),
+        default=None,
+        help="실제 적용 동시 처리 수(기본값: 2, dry-run은 1만 허용)",
+    )
     parser.add_argument("--self-test", action="store_true", help="파일명/시간 변환 자체 검사 후 종료")
     args = parser.parse_args()
     if not args.self_test and not args.root:
         parser.error("root가 필요합니다. 자체 검사만 실행하려면 --self-test를 사용하세요.")
+    if not args.self_test and not args.apply and args.workers not in (None, 1):
+        parser.error("dry-run에서는 --workers 1만 사용할 수 있습니다.")
+    if args.workers is None:
+        args.workers = 2 if args.apply else 1
     return args
 
 
@@ -263,6 +305,10 @@ def exiftool_environment():
     return environment
 
 
+class ExifToolProcessError(RuntimeError):
+    pass
+
+
 class ExifToolSession:
     def __init__(self, executable):
         try:
@@ -301,7 +347,7 @@ class ExifToolSession:
 
     def execute(self, arguments):
         if self.process.poll() is not None:
-            raise RuntimeError(
+            raise ExifToolProcessError(
                 f"ExifTool이 예기치 않게 종료되었습니다: {self.process.returncode}"
             )
         self.command_id += 1
@@ -320,14 +366,16 @@ class ExifToolSession:
             self.process.stdin.write(payload)
             self.process.stdin.flush()
         except (BrokenPipeError, OSError) as error:
-            raise RuntimeError(f"ExifTool 명령 전송 실패: {error}") from error
+            raise ExifToolProcessError(f"ExifTool 명령 전송 실패: {error}") from error
 
         output_lines = []
         ready = f"{{ready{command_id}}}"
         while True:
             line = self.process.stdout.readline()
             if not line:
-                raise RuntimeError("ExifTool 응답을 받기 전에 프로세스가 종료되었습니다.")
+                raise ExifToolProcessError(
+                    "ExifTool 응답을 받기 전에 프로세스가 종료되었습니다."
+                )
             if line.rstrip("\r\n") == ready:
                 break
             output_lines.append(line)
@@ -336,7 +384,7 @@ class ExifToolSession:
         while True:
             line = self.error_lines.get()
             if line is None:
-                raise RuntimeError("ExifTool 종료 상태를 받지 못했습니다.")
+                raise ExifToolProcessError("ExifTool 종료 상태를 받지 못했습니다.")
             text = line.rstrip("\r\n")
             if text.startswith(status_marker):
                 try:
@@ -507,7 +555,23 @@ def write_metadata(executable, path, planned, no_backup, session=None):
     return run_exiftool(executable, arguments, session)
 
 
+def restore_creation_time(path, timestamp_ns):
+    if os.name != "nt":
+        return
+    ticks = timestamp_ns // 100 + WINDOWS_EPOCH_100NS
+    creation = wintypes.FILETIME(ticks & 0xFFFFFFFF, ticks >> 32)
+    handle = CREATE_FILE(str(path), 0x100, 0x7, None, 3, 0, None)
+    if handle == INVALID_HANDLE_VALUE:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        if not SET_FILE_TIME(handle, ctypes.byref(creation), None, None):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        CLOSE_HANDLE(handle)
+
+
 def restore_access_and_modify_times(path, before):
+    restore_creation_time(path, before.st_ctime_ns)
     os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
 
 
@@ -575,11 +639,6 @@ def blank_row(path):
 
 def compact_json(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
-
-
-def record_skip(writer, row, result, error=""):
-    row.update(action="SKIPPED", result=result, error=error)
-    writer.writerow(row)
 
 
 def run_self_test():
@@ -694,6 +753,241 @@ def print_summary(stats, emit=console_emit):
         emit(f"{pattern}: {stats['patterns'][pattern]}")
 
 
+def _new_stats():
+    return {
+        "total": 0,
+        "matched": 0,
+        "modified": 0,
+        "dry_run": 0,
+        "already": 0,
+        "conflicts": 0,
+        "pattern_mismatch": 0,
+        "unsupported": 0,
+        "out_of_range": 0,
+        "not_local": 0,
+        "failed": 0,
+        "verify_failed": 0,
+        "cancelled": 0,
+        "patterns": {pattern: 0 for pattern in PATTERN_NAMES},
+    }
+
+
+def _skip_row(row, result, error=""):
+    row.update(action="SKIPPED", result=result, error=error)
+    return row
+
+
+def _process_file(
+    item,
+    *,
+    session,
+    exiftool,
+    apply_changes,
+    overwrite_existing,
+    no_backup,
+    log_all_skips,
+    lower_bound,
+    upper_bound,
+):
+    path, scanned_details, scan_error, match = item
+    row = blank_row(path)
+    counts = {"patterns": {}}
+    session_broken = False
+
+    def count(key):
+        counts[key] = counts.get(key, 0) + 1
+
+    if scanned_details is None:
+        count("failed")
+        return _skip_row(row, "UNREADABLE", scan_error), counts, False
+
+    count("total")
+    if is_temporary_or_backup(path.name):
+        count("pattern_mismatch")
+        return (
+            _skip_row(row, "SKIPPED", "TEMP_OR_BACKUP") if log_all_skips else None,
+            counts,
+            False,
+        )
+    if not match:
+        count("pattern_mismatch")
+        return (
+            _skip_row(row, "SKIPPED", "PATTERN_MISMATCH") if log_all_skips else None,
+            counts,
+            False,
+        )
+
+    count("matched")
+    counts["patterns"][match["pattern"]] = 1
+    row.update(
+        pattern=match["pattern"],
+        timestamp_ms=match["timestamp_ms"],
+        precision="seconds" if match["extension"] in VIDEO_EXTENSIONS else "milliseconds",
+        backup_expected="no" if no_backup else "yes",
+    )
+    if not match["supported"]:
+        count("unsupported")
+        return _skip_row(row, "UNSUPPORTED_EXTENSION"), counts, False
+
+    attributes = getattr(scanned_details, "st_file_attributes", 0)
+    if scan_error == "NOT_LOCAL" or attributes & PLACEHOLDER_FLAGS:
+        count("not_local")
+        return _skip_row(row, "NOT_LOCAL"), counts, False
+    if not os.access(path, os.R_OK):
+        count("not_local")
+        return _skip_row(row, "UNREADABLE"), counts, False
+
+    try:
+        utc, local = timestamp_datetimes(match["timestamp_ms"])
+    except (OverflowError, OSError, ValueError) as error:
+        count("out_of_range")
+        return _skip_row(row, "OUT_OF_RANGE", str(error)), counts, False
+    row.update(
+        target_datetime_utc=utc.isoformat(timespec="milliseconds"),
+        target_datetime_local=local.isoformat(timespec="milliseconds"),
+    )
+    if not (lower_bound <= utc <= upper_bound):
+        count("out_of_range")
+        return _skip_row(row, "OUT_OF_RANGE"), counts, False
+
+    planned = target_tags(match["extension"], utc, local)
+    row["planned_tags"] = compact_json(planned)
+    video = match["extension"] in VIDEO_EXTENSIONS
+    try:
+        before = path.stat()
+        try:
+            metadata = read_metadata(exiftool, path, video, session)
+        finally:
+            restore_access_and_modify_times(path, before)
+        after_read = path.stat()
+    except (OSError, RuntimeError) as error:
+        count("failed")
+        session_broken = isinstance(error, ExifToolProcessError)
+        return _skip_row(row, "FAILED", str(error)), counts, session_broken
+    row["existing_metadata"] = compact_json(metadata)
+    if not same_source_state(before, after_read):
+        count("failed")
+        return (
+            _skip_row(row, "FAILED", "파일 크기 또는 수정 시각이 메타데이터 검사 중 변경됨"),
+            counts,
+            False,
+        )
+
+    state, detail = metadata_state(metadata, match["extension"], planned, utc, local)
+    if state == "ALREADY_CORRECT":
+        count("already")
+        return _skip_row(row, "ALREADY_CORRECT"), counts, False
+    if state == "CONFLICT" and not overwrite_existing:
+        count("conflicts")
+        return _skip_row(row, "CONFLICT", detail), counts, False
+    if not apply_changes:
+        count("dry_run")
+        row.update(
+            action="DRY_RUN",
+            result="DRY_RUN",
+            error=("overwrite enabled: " + detail) if detail else "",
+        )
+        return row, counts, False
+
+    original_system_times = system_times(metadata)
+    if os.name == "nt" and "FileCreateDate" not in original_system_times:
+        count("failed")
+        return (
+            _skip_row(row, "FAILED", "Windows FileCreateDate를 읽어 보존 여부를 확인할 수 없음"),
+            counts,
+            False,
+        )
+    backup_path = Path(str(path) + "_original")
+    if not no_backup and backup_path.exists():
+        count("failed")
+        return (
+            _skip_row(row, "FAILED", f"기존 백업을 덮어쓰지 않음: {backup_path}"),
+            counts,
+            False,
+        )
+    try:
+        current = path.stat()
+        if not same_source_state(before, current):
+            raise RuntimeError("파일 크기 또는 수정 시각이 쓰기 직전 변경됨")
+        code, output, warning = write_metadata(
+            exiftool, path, planned, no_backup, session
+        )
+        restore_access_and_modify_times(path, before)
+        if code:
+            raise RuntimeError(warning or output or f"ExifTool 쓰기 종료 코드 {code}")
+        verified_metadata = read_metadata(exiftool, path, video, session)
+        restore_access_and_modify_times(path, before)
+        final_details = path.stat()
+        verify_state, verify_detail = metadata_state(
+            verified_metadata, match["extension"], planned, utc, local
+        )
+        final_system_times = system_times(verified_metadata)
+        verification_errors = []
+        if verify_state != "ALREADY_CORRECT":
+            verification_errors.append(verify_detail or "대상 태그가 모두 기록되지 않음")
+        if not reasonable_output_size(before.st_size, final_details.st_size):
+            verification_errors.append(
+                f"비정상 파일 크기: {before.st_size} -> {final_details.st_size}"
+            )
+        if final_details.st_mtime_ns != before.st_mtime_ns:
+            verification_errors.append("파일 시스템 수정 시각 보존 실패")
+        if os.name == "nt" and final_details.st_ctime_ns != before.st_ctime_ns:
+            verification_errors.append("파일 시스템 생성 시각 보존 실패")
+        if original_system_times != final_system_times:
+            verification_errors.append(
+                "파일 시스템 생성/수정 시각 보존 실패: "
+                f"{original_system_times!r} -> {final_system_times!r}"
+            )
+        if not no_backup and not backup_path.exists():
+            verification_errors.append("예상한 _original 백업이 생성되지 않음")
+        if warning:
+            row["error"] = f"ExifTool warning: {warning}"
+        if verification_errors:
+            count("verify_failed")
+            row.update(
+                action="MODIFIED",
+                result="VERIFY_FAILED",
+                error="; ".join(
+                    ([row["error"]] if row["error"] else []) + verification_errors
+                )
+                + (f"; 백업 확인: {backup_path}" if not no_backup else ""),
+            )
+        else:
+            count("modified")
+            row.update(action="MODIFIED", result="MODIFIED")
+    except (OSError, RuntimeError) as error:
+        session_broken = isinstance(error, ExifToolProcessError)
+        try:
+            if path.exists():
+                restore_access_and_modify_times(path, before)
+        except OSError as restore_error:
+            error = RuntimeError(f"{error}; 파일 시각 복원 실패: {restore_error}")
+        count("failed")
+        row.update(action="MODIFIED", result="FAILED", error=str(error))
+    return row, counts, session_broken
+
+
+def _record_result(stats, writer, result):
+    row, counts, _ = result
+    for key, value in counts.items():
+        if key == "patterns":
+            for pattern, amount in value.items():
+                stats["patterns"][pattern] += amount
+        else:
+            stats[key] += value
+    if row is not None:
+        writer.writerow(row)
+
+
+def _start_session(exiftool):
+    session = ExifToolSession(exiftool)
+    try:
+        return session, exiftool_version(exiftool, session)
+    except RuntimeError:
+        session.close()
+        raise
+
+
 def process_media(
     root,
     *,
@@ -706,7 +1000,12 @@ def process_media(
     emit=console_emit,
     on_progress=None,
     should_stop=None,
+    workers=1,
 ):
+    if workers not in (1, 2, 4):
+        emit("ERROR: workers는 1, 2, 4 중 하나여야 합니다.", error=True)
+        return 2, None, None
+    actual_workers = workers if apply_changes else 1
     root = Path(os.path.abspath(root))
     if not root.exists() or not root.is_dir():
         emit(f"ERROR: 루트 폴더가 없거나 디렉터리가 아닙니다: {root}", error=True)
@@ -726,34 +1025,23 @@ def process_media(
     log_path = log_dir / datetime.now().strftime(
         "fix_media_dates_%Y%m%d_%H%M%S_%f.csv"
     )
-    session = None
+    sessions = []
     try:
-        session = ExifToolSession(exiftool)
-        version = exiftool_version(exiftool, session)
+        for _ in range(actual_workers):
+            session, current_version = _start_session(exiftool)
+            sessions.append(session)
+            if len(sessions) == 1:
+                version = current_version
     except RuntimeError as error:
-        if session is not None:
+        for session in sessions:
             session.close()
         emit(f"ERROR: {error}", error=True)
         return 2, None, None
-    stats = {
-        "total": 0,
-        "matched": 0,
-        "modified": 0,
-        "dry_run": 0,
-        "already": 0,
-        "conflicts": 0,
-        "pattern_mismatch": 0,
-        "unsupported": 0,
-        "out_of_range": 0,
-        "not_local": 0,
-        "failed": 0,
-        "verify_failed": 0,
-        "cancelled": 0,
-        "patterns": {pattern: 0 for pattern in PATTERN_NAMES},
-    }
+    stats = _new_stats()
 
     emit(f"ExifTool: {version}")
     emit(f"Mode: {'APPLY' if apply_changes else 'DRY-RUN'}")
+    emit(f"Workers: {actual_workers}")
     emit(f"Root: {root}")
     emit(f"CSV: {log_path}")
     emit("주의: 전체 적용 전 OneDrive 동기화를 일시 중지하고 테스트 복사본으로 검증하세요.")
@@ -794,199 +1082,91 @@ def process_media(
     total_files = len(files)
 
     processed = 0
-    with session, log_path.open("x", encoding="utf-8-sig", newline="") as log_file:
-        writer = csv.DictWriter(log_file, fieldnames=CSV_FIELDS)
-        writer.writeheader()
-        for index, (path, scanned_details, scan_error, match) in enumerate(files, 1):
-            if should_stop and should_stop():
-                stats["cancelled"] = 1
-                break
-            processed = index
-            if on_progress:
-                on_progress(index, total_files, path.name)
-            row = blank_row(path)
-            if scanned_details is None:
-                stats["failed"] += 1
-                row.update(action="SKIPPED", result="UNREADABLE", error=scan_error)
-                writer.writerow(row)
-                continue
-
-            stats["total"] += 1
-            if is_temporary_or_backup(path.name):
-                stats["pattern_mismatch"] += 1
-                if log_all_skips:
-                    record_skip(writer, row, "SKIPPED", "TEMP_OR_BACKUP")
-                continue
-
-            if not match:
-                stats["pattern_mismatch"] += 1
-                if log_all_skips:
-                    record_skip(writer, row, "SKIPPED", "PATTERN_MISMATCH")
-                continue
-
-            stats["matched"] += 1
-            stats["patterns"][match["pattern"]] += 1
-            row.update(
-                pattern=match["pattern"],
-                timestamp_ms=match["timestamp_ms"],
-                precision="seconds" if match["extension"] in VIDEO_EXTENSIONS else "milliseconds",
-                backup_expected="no" if no_backup else "yes",
-            )
-            if not match["supported"]:
-                stats["unsupported"] += 1
-                record_skip(writer, row, "UNSUPPORTED_EXTENSION")
-                continue
-
-            attributes = getattr(scanned_details, "st_file_attributes", 0)
-            if scan_error == "NOT_LOCAL" or attributes & PLACEHOLDER_FLAGS:
-                stats["not_local"] += 1
-                record_skip(writer, row, "NOT_LOCAL")
-                continue
-            if not os.access(path, os.R_OK):
-                stats["not_local"] += 1
-                record_skip(writer, row, "UNREADABLE")
-                continue
-
-            try:
-                utc, local = timestamp_datetimes(match["timestamp_ms"])
-            except (OverflowError, OSError, ValueError) as error:
-                stats["out_of_range"] += 1
-                record_skip(writer, row, "OUT_OF_RANGE", str(error))
-                continue
-            row.update(
-                target_datetime_utc=utc.isoformat(timespec="milliseconds"),
-                target_datetime_local=local.isoformat(timespec="milliseconds"),
-            )
-            if not (lower_bound <= utc <= upper_bound):
-                stats["out_of_range"] += 1
-                record_skip(writer, row, "OUT_OF_RANGE")
-                continue
-
-            planned = target_tags(match["extension"], utc, local)
-            row["planned_tags"] = compact_json(planned)
-            video = match["extension"] in VIDEO_EXTENSIONS
-            try:
-                before = path.stat()
-                try:
-                    metadata = read_metadata(exiftool, path, video, session)
-                finally:
-                    restore_access_and_modify_times(path, before)
-                after_read = path.stat()
-            except (OSError, RuntimeError) as error:
-                stats["failed"] += 1
-                row.update(action="SKIPPED", result="FAILED", error=str(error))
-                writer.writerow(row)
-                continue
-            row["existing_metadata"] = compact_json(metadata)
-            if not same_source_state(before, after_read):
-                stats["failed"] += 1
-                row.update(
-                    action="SKIPPED",
-                    result="FAILED",
-                    error="파일 크기 또는 수정 시각이 메타데이터 검사 중 변경됨",
-                )
-                writer.writerow(row)
-                continue
-
-            state, detail = metadata_state(
-                metadata, match["extension"], planned, utc, local
-            )
-            if state == "ALREADY_CORRECT":
-                stats["already"] += 1
-                record_skip(writer, row, "ALREADY_CORRECT")
-                continue
-            if state == "CONFLICT" and not overwrite_existing:
-                stats["conflicts"] += 1
-                record_skip(writer, row, "CONFLICT", detail)
-                continue
-
+    worker_failure = False
+    try:
+        with log_path.open("x", encoding="utf-8-sig", newline="") as log_file:
+            writer = csv.DictWriter(log_file, fieldnames=CSV_FIELDS)
+            writer.writeheader()
+            common = {
+                "exiftool": exiftool,
+                "apply_changes": apply_changes,
+                "overwrite_existing": overwrite_existing,
+                "no_backup": no_backup,
+                "log_all_skips": log_all_skips,
+                "lower_bound": lower_bound,
+                "upper_bound": upper_bound,
+            }
             if not apply_changes:
-                stats["dry_run"] += 1
-                row.update(
-                    action="DRY_RUN",
-                    result="DRY_RUN",
-                    error=("overwrite enabled: " + detail) if detail else "",
-                )
-                writer.writerow(row)
-                continue
-
-            original_system_times = system_times(metadata)
-            if os.name == "nt" and "FileCreateDate" not in original_system_times:
-                stats["failed"] += 1
-                row.update(
-                    action="SKIPPED",
-                    result="FAILED",
-                    error="Windows FileCreateDate를 읽어 보존 여부를 확인할 수 없음",
-                )
-                writer.writerow(row)
-                continue
-            backup_path = Path(str(path) + "_original")
-            if not no_backup and backup_path.exists():
-                stats["failed"] += 1
-                row.update(
-                    action="SKIPPED",
-                    result="FAILED",
-                    error=f"기존 백업을 덮어쓰지 않음: {backup_path}",
-                )
-                writer.writerow(row)
-                continue
-            try:
-                current = path.stat()
-                if not same_source_state(before, current):
-                    raise RuntimeError("파일 크기 또는 수정 시각이 쓰기 직전 변경됨")
-                code, output, warning = write_metadata(
-                    exiftool, path, planned, no_backup, session
-                )
-                restore_access_and_modify_times(path, before)
-                if code:
-                    raise RuntimeError(warning or output or f"ExifTool 쓰기 종료 코드 {code}")
-                verified_metadata = read_metadata(exiftool, path, video, session)
-                restore_access_and_modify_times(path, before)
-                final_details = path.stat()
-                verify_state, verify_detail = metadata_state(
-                    verified_metadata, match["extension"], planned, utc, local
-                )
-                final_system_times = system_times(verified_metadata)
-                verification_errors = []
-                if verify_state != "ALREADY_CORRECT":
-                    verification_errors.append(verify_detail or "대상 태그가 모두 기록되지 않음")
-                if not reasonable_output_size(before.st_size, final_details.st_size):
-                    verification_errors.append(
-                        f"비정상 파일 크기: {before.st_size} -> {final_details.st_size}"
-                    )
-                if final_details.st_mtime_ns != before.st_mtime_ns:
-                    verification_errors.append("파일 시스템 수정 시각 보존 실패")
-                if original_system_times != final_system_times:
-                    verification_errors.append(
-                        "파일 시스템 생성/수정 시각 보존 실패: "
-                        f"{original_system_times!r} -> {final_system_times!r}"
-                    )
-                if not no_backup and not backup_path.exists():
-                    verification_errors.append("예상한 _original 백업이 생성되지 않음")
-                if warning:
-                    row["error"] = f"ExifTool warning: {warning}"
-                if verification_errors:
-                    stats["verify_failed"] += 1
-                    row.update(
-                        action="MODIFIED",
-                        result="VERIFY_FAILED",
-                        error="; ".join(
-                            ([row["error"]] if row["error"] else []) + verification_errors
-                        )
-                        + (f"; 백업 확인: {backup_path}" if not no_backup else ""),
-                    )
-                else:
-                    stats["modified"] += 1
-                    row.update(action="MODIFIED", result="MODIFIED")
-            except (OSError, RuntimeError) as error:
-                try:
-                    if path.exists():
-                        restore_access_and_modify_times(path, before)
-                except OSError as restore_error:
-                    error = RuntimeError(f"{error}; 파일 시각 복원 실패: {restore_error}")
-                stats["failed"] += 1
-                row.update(action="MODIFIED", result="FAILED", error=str(error))
-            writer.writerow(row)
+                for item in files:
+                    if should_stop and should_stop():
+                        stats["cancelled"] = 1
+                        break
+                    result = _process_file(item, session=sessions[0], **common)
+                    _record_result(stats, writer, result)
+                    processed += 1
+                    if on_progress:
+                        on_progress(processed, total_files, item[0].name)
+            else:
+                available = list(sessions)
+                pending = {}
+                buffered = {}
+                next_submit = 0
+                next_write = 0
+                stop_scheduling = False
+                with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+                    while pending or (
+                        next_submit < total_files and not stop_scheduling
+                    ):
+                        if should_stop and should_stop():
+                            stats["cancelled"] = 1
+                            stop_scheduling = True
+                        while (
+                            available
+                            and next_submit < total_files
+                            and not stop_scheduling
+                        ):
+                            session = available.pop()
+                            future = executor.submit(
+                                _process_file,
+                                files[next_submit],
+                                session=session,
+                                **common,
+                            )
+                            pending[future] = (next_submit, session)
+                            next_submit += 1
+                        if not pending:
+                            break
+                        done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                        for future in done:
+                            index, session = pending.pop(future)
+                            result = future.result()
+                            buffered[index] = result
+                            processed += 1
+                            if on_progress:
+                                on_progress(processed, total_files, files[index][0].name)
+                            if result[2]:
+                                session.close()
+                                try:
+                                    replacement, _ = _start_session(exiftool)
+                                except RuntimeError as error:
+                                    emit(
+                                        f"ERROR: ExifTool 워커 재시작 실패: {error}",
+                                        error=True,
+                                    )
+                                    worker_failure = True
+                                    stop_scheduling = True
+                                else:
+                                    sessions.remove(session)
+                                    sessions.append(replacement)
+                                    available.append(replacement)
+                            else:
+                                available.append(session)
+                        while next_write in buffered:
+                            _record_result(stats, writer, buffered.pop(next_write))
+                            next_write += 1
+    finally:
+        for session in sessions:
+            session.close()
 
     if on_progress:
         on_progress(processed, total_files, "중단됨" if stats["cancelled"] else "완료")
@@ -994,11 +1174,14 @@ def process_media(
         emit("취소 요청에 따라 파일 사이에서 안전하게 중단했습니다.")
     print_summary(stats, emit)
     emit(f"CSV log: {log_path}")
-    code = (
-        130
-        if stats["cancelled"]
-        else 1 if stats["failed"] or stats["verify_failed"] else 0
-    )
+    if worker_failure:
+        code = 1
+    elif stats["cancelled"]:
+        code = 130
+    elif stats["failed"] or stats["verify_failed"]:
+        code = 1
+    else:
+        code = 0
     return code, stats, log_path
 
 
@@ -1014,6 +1197,7 @@ def main():
         no_backup=args.no_backup,
         log_all_skips=args.log_all_skips,
         exiftool=args.exiftool,
+        workers=args.workers,
     )
     return code
 
