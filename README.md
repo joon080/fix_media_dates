@@ -23,7 +23,7 @@ media date fixer/
 
 1. `찾아보기`를 눌러 미디어 폴더를 선택합니다.
 2. 필요하면 `검사 (dry run)`로 수정 대상과 충돌을 먼저 확인합니다.
-3. `실제 적용`을 누르고 확인 창에서 적용을 승인합니다.
+3. `실행`을 누르고 확인 창에서 적용을 승인합니다.
 4. 완료 후 화면의 결과와 CSV 로그를 확인합니다.
 
 Dry Run은 선택 사항이지만 많은 파일에 처음 적용할 때는 먼저 실행하는 것을 권장합니다.
@@ -35,6 +35,16 @@ Dry Run은 선택 사항이지만 많은 파일에 처음 적용할 때는 먼�
 | `원본 백업 만들기` | 켜짐 | 수정 전 파일을 `<파일명>_original`로 보관합니다. 선택하면 초록색 체크가 표시됩니다. |
 | `적용 동시 처리` | 2개 | 실제 적용에서 독립된 ExifTool 세션 1·2·4개로 파일을 병렬 처리합니다. Dry Run은 항상 1개입니다. |
 | `중단` | - | 새 작업 배정을 멈추고 처리 중인 파일 최대 N개가 끝난 뒤 중단합니다. |
+
+## JPEG 오류 자동 복구
+
+검사나 실행이 끝나면 `FAILED`, `VERIFY_FAILED`, `UNREADABLE` 결과를 형식별로 집계해 안내합니다. Dry Run은 오류를 보여주기만 하며 파일을 변경하지 않습니다.
+
+실행 중 JPG/JPEG에서 ExifTool의 `Error reading OtherImageStart data in IFD0` 또는 `IFD1` 오류가 확인된 경우에만 자동 복구를 제안합니다. 복구는 손상된 EXIF 구조를 메모리에서 다시 만들고 잘못된 `OtherImageStart`/`OtherImageLength` 포인터를 제외한 뒤 한 파일씩 처리합니다. PNG, MP4, MOV와 다른 JPEG 오류는 현재 집계만 하고 복구하지 않습니다.
+
+복구 전후에 Pillow로 전체 JPEG를 디코드해 픽셀, 크기, 색상 모드, ICC 프로필이 같은지 확인하고 ExifTool로 구조와 날짜를 다시 검증합니다. 기존 날짜가 충돌하고 `기존 날짜 덮어쓰기`가 꺼져 있으면 구조만 복구하고 날짜는 보존합니다. 백업을 끈 경우에도 검증이 끝날 때까지 임시 안전 백업을 유지하며, 사후 검증 실패 시 원본으로 롤백합니다.
+
+일반 실행 결과는 `fix_media_dates_*.csv`, 복구 결과는 별도의 `repair_media_dates_*.csv`에 저장됩니다. 복구 후 화면의 로그와 `CSV 로그 열기`는 복구 CSV를 가리킵니다.
 
 동시 처리 수를 늘리면 SSD에서는 적용 시간이 줄어들 수 있지만, 단일 HDD나 OneDrive 동기화 폴더에서는 저장장치 부하 때문에 오히려 느려질 수 있습니다. 이때는 `1개`를 선택하세요. ExifTool은 수정 중 임시 파일을 만들며 백업 옵션을 켜면 `_original`도 남기므로, 동시 처리 수만큼 큰 미디어 파일을 함께 처리할 여유 공간이 필요합니다.
 
@@ -76,7 +86,11 @@ Dry Run은 선택 사항이지만 많은 파일에 처음 적용할 때는 먼�
 
 ## 소스 코드로 실행
 
-Python 3과 ExifTool이 설치된 개발 환경에서는 기존 CLI도 사용할 수 있습니다. 기본 실행은 Dry Run입니다.
+Python 3, `requirements.txt`의 Pillow, ExifTool이 설치된 개발 환경에서는 기존 CLI도 사용할 수 있습니다. 기본 실행은 Dry Run입니다.
+
+```powershell
+py -3 -m pip install -r .\requirements.txt
+```
 
 ```powershell
 py -3 .\fix_media_dates.py "C:\path\to\media" --exiftool "C:\path\to\exiftool.exe"
@@ -99,3 +113,4 @@ py -3 -m PyInstaller --noconfirm --clean --onefile --windowed --name "Media Date
 ```
 
 완성된 파일은 `dist\Media Date Fixer.exe`에 생성됩니다. 배포할 때는 ExifTool의 `exiftool.exe`와 `exiftool_files` 폴더를 실행 파일 옆에 함께 넣어야 합니다.
+Pillow는 소스에서 직접 import하므로 PyInstaller 빌드에 함께 포함됩니다.

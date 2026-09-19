@@ -4,6 +4,8 @@
 import argparse
 import csv
 import ctypes
+import hashlib
+import io
 import json
 import os
 import queue
@@ -15,6 +17,8 @@ import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from PIL import Image, UnidentifiedImageError
 
 if os.name == "nt":
     from ctypes import wintypes
@@ -76,8 +80,11 @@ CSV_FIELDS = (
     "result",
     "precision",
     "backup_expected",
+    "repair_kind",
     "error",
 )
+REPAIR_KIND_JPEG_OTHER_IMAGE_START = "JPEG_OTHER_IMAGE_START"
+ERROR_RESULTS = {"FAILED", "VERIFY_FAILED", "UNREADABLE"}
 FILE_ATTRIBUTE_DIRECTORY = 0x10
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 FILE_ATTRIBUTE_OFFLINE = 0x1000
@@ -591,6 +598,8 @@ def is_temporary_or_backup(name):
     lower = name.lower()
     return (
         lower.endswith("_original")
+        or lower.endswith(".media-date-fixer-repair")
+        or lower.endswith(".media-date-fixer-safety")
         or lower.startswith("~$")
         or Path(lower).suffix in {".tmp", ".temp", ".part", ".partial", ".crdownload"}
     )
@@ -639,6 +648,383 @@ def blank_row(path):
 
 def compact_json(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def classify_repair_kind(row):
+    if (
+        str(row.get("extension", "")).lower() not in {".jpg", ".jpeg"}
+        or row.get("action") != "SKIPPED"
+        or row.get("result") != "FAILED"
+    ):
+        return ""
+    error = str(row.get("error", ""))
+    signature = r"Error reading OtherImageStart data in IFD[01](?=$|[\s;])"
+    if len(re.findall(signature, error)) != 1 or "OtherImageLength" in error:
+        return ""
+    if "Error reading" in re.sub(signature, "", error):
+        return ""
+    return REPAIR_KIND_JPEG_OTHER_IMAGE_START
+
+
+def _run_exiftool_bytes(executable, arguments, data):
+    try:
+        completed = subprocess.run(
+            [executable, *arguments, "-"],
+            input=data,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            check=False,
+            env=exiftool_environment(),
+            creationflags=NO_WINDOW,
+        )
+    except OSError as error:
+        raise RuntimeError(f"ExifTool 실행 실패: {error}") from error
+    return completed.returncode, completed.stdout, decode_output(completed.stderr)
+
+
+def _metadata_from_jpeg_bytes(executable, data):
+    code, output, error = _run_exiftool_bytes(
+        executable, ["-j", "-a", "-G1", "-s", "-time:all"], data
+    )
+    if code or error:
+        raise RuntimeError(error or f"ExifTool 메타데이터 검사 종료 코드 {code}")
+    try:
+        metadata = json.loads(output.decode("utf-8", errors="replace"))[0]
+    except (json.JSONDecodeError, IndexError, TypeError) as problem:
+        raise RuntimeError(f"ExifTool JSON 해석 실패: {problem}") from problem
+    return {key: value for key, value in metadata.items() if key != "SourceFile"}
+
+
+def _validate_jpeg_bytes(executable, data):
+    code, output, error = _run_exiftool_bytes(
+        executable,
+        ["-j", "-a", "-G1", "-s", "-validate", "-warning", "-error"],
+        data,
+    )
+    if code or error:
+        raise RuntimeError(error or f"ExifTool 검증 종료 코드 {code}")
+    try:
+        validation = json.loads(output.decode("utf-8", errors="replace"))[0]
+    except (json.JSONDecodeError, IndexError, TypeError) as problem:
+        raise RuntimeError(f"ExifTool 검증 JSON 해석 실패: {problem}") from problem
+    messages = []
+    for key, value in validation.items():
+        name = key.rsplit(":", 1)[-1]
+        if name.startswith("Error"):
+            messages.append(str(value))
+        elif name.startswith("Warning") and re.search(
+            r"OtherImage(?:Start|Length)|Entries in IFD0 (?:were|are) out of (?:sequence|order)",
+            str(value),
+        ):
+            messages.append(str(value))
+    if messages:
+        raise RuntimeError("ExifTool 검증 실패: " + "; ".join(messages))
+
+
+def _jpeg_fingerprint(data):
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if image.format != "JPEG":
+                raise RuntimeError(f"JPEG 형식이 아님: {image.format}")
+            image.load()
+            icc = image.info.get("icc_profile")
+            return (
+                image.size,
+                image.mode,
+                hashlib.sha256(image.tobytes()).hexdigest(),
+                None if icc is None else hashlib.sha256(icc).hexdigest(),
+            )
+    except (OSError, UnidentifiedImageError) as error:
+        raise RuntimeError(f"Pillow JPEG 완전 디코드 실패: {error}") from error
+
+
+def _rebuild_jpeg_exif(executable, data):
+    code, output, error = _run_exiftool_bytes(
+        executable,
+        ["-q", "-q", "-m", "-EXIF:All=", "-All:All<EXIF:All", "-o", "-"],
+        data,
+    )
+    if code or not output:
+        raise RuntimeError(error or f"ExifTool EXIF 재구성 종료 코드 {code}")
+    return output
+
+
+def _write_jpeg_dates(executable, data, planned):
+    arguments = ["-q", "-q", "-m"]
+    arguments += [f"-{tag}={value}" for tag, value in planned.items()]
+    arguments += ["-o", "-"]
+    code, output, error = _run_exiftool_bytes(executable, arguments, data)
+    if code or error or not output:
+        raise RuntimeError(error or f"ExifTool 날짜 기록 종료 코드 {code}")
+    return output
+
+
+def _current_repair_kind(executable, path, row):
+    code, output, error = run_exiftool(
+        executable, ["-j", "-a", "-G1", "-s", "-time:all", str(path)]
+    )
+    probe = dict(row)
+    probe["error"] = error or (output if code else "")
+    return classify_repair_kind(probe)
+
+
+def _repair_path(root, row):
+    root = Path(root).resolve(strict=True)
+    raw = Path(str(row.get("filepath", "")))
+    if not raw.is_absolute() or raw.name != row.get("filename"):
+        raise RuntimeError("CSV 파일 경로 또는 파일명이 올바르지 않음")
+    path = raw.resolve(strict=True)
+    try:
+        path.relative_to(root)
+    except ValueError as error:
+        raise RuntimeError("CSV 파일 경로가 선택한 루트 밖에 있음") from error
+    if raw.is_symlink() or path.suffix.lower() not in {".jpg", ".jpeg"}:
+        raise RuntimeError("복구 대상이 로컬 JPEG 일반 파일이 아님")
+    details = path.stat()
+    if not stat.S_ISREG(details.st_mode) or getattr(
+        details, "st_file_attributes", 0
+    ) & FILE_ATTRIBUTE_REPARSE_POINT:
+        raise RuntimeError("복구 대상이 로컬 JPEG 일반 파일이 아님")
+    if path.suffix.lower() != str(row.get("extension", "")).lower():
+        raise RuntimeError("현재 확장자가 CSV 기록과 다름")
+    match = match_filename(path.name)
+    if (
+        not match
+        or not match["supported"]
+        or match["extension"] not in {".jpg", ".jpeg"}
+        or str(match["timestamp_ms"]) != str(row.get("timestamp_ms", ""))
+        or match["pattern"] != row.get("pattern")
+    ):
+        raise RuntimeError("현재 파일명이 CSV의 날짜 정보와 다름")
+    return path, match
+
+
+def _write_exclusive(path, data, mode, timestamps):
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    with os.fdopen(descriptor, "wb") as output:
+        output.write(data)
+        output.flush()
+        os.fsync(output.fileno())
+    restore_access_and_modify_times(path, timestamps)
+
+
+def _verify_repair_output(
+    executable,
+    data,
+    original_fingerprint,
+    original_size,
+    extension,
+    planned,
+    utc,
+    local,
+    preserved_entries,
+):
+    if _jpeg_fingerprint(data) != original_fingerprint:
+        raise RuntimeError("픽셀, 크기, 색상 모드 또는 ICC 프로필이 원본과 다름")
+    if not reasonable_output_size(original_size, len(data)):
+        raise RuntimeError(f"비정상 파일 크기: {original_size} -> {len(data)}")
+    _validate_jpeg_bytes(executable, data)
+    metadata = _metadata_from_jpeg_bytes(executable, data)
+    if preserved_entries is None:
+        state, detail = metadata_state(metadata, extension, planned, utc, local)
+        if state != "ALREADY_CORRECT":
+            raise RuntimeError(detail or "대상 날짜 태그가 모두 기록되지 않음")
+    elif sorted(target_entries(metadata, extension)) != preserved_entries:
+        raise RuntimeError("기존 충돌 날짜가 보존되지 않음")
+    return metadata
+
+
+def repair_jpeg_other_image(
+    root,
+    row,
+    *,
+    exiftool,
+    overwrite_existing=False,
+    no_backup=False,
+):
+    result_row = {field: row.get(field, "") for field in CSV_FIELDS}
+    result_row["repair_kind"] = classify_repair_kind(row)
+    path = None
+    before = None
+    replaced = False
+    safety_path = None
+    temp_path = None
+    try:
+        if result_row["repair_kind"] != REPAIR_KIND_JPEG_OTHER_IMAGE_START:
+            raise RuntimeError("지원되는 복구 오류가 아님")
+        path, match = _repair_path(root, row)
+        before = path.stat()
+        if _current_repair_kind(exiftool, path, row) != result_row["repair_kind"]:
+            raise RuntimeError("현재 파일의 ExifTool 오류 서명이 CSV 기록과 다름")
+        original = path.read_bytes()
+        if not same_source_state(before, path.stat()) or len(original) != before.st_size:
+            raise RuntimeError("파일이 복구 검사 중 변경됨")
+        original_fingerprint = _jpeg_fingerprint(original)
+        rebuilt = _rebuild_jpeg_exif(exiftool, original)
+        metadata = _metadata_from_jpeg_bytes(exiftool, rebuilt)
+        utc, local = timestamp_datetimes(match["timestamp_ms"])
+        planned = target_tags(match["extension"], utc, local)
+        state, _ = metadata_state(metadata, match["extension"], planned, utc, local)
+        preserve_conflict = state == "CONFLICT" and not overwrite_existing
+        preserved_entries = (
+            sorted(target_entries(metadata, match["extension"]))
+            if preserve_conflict
+            else None
+        )
+        repaired = (
+            rebuilt
+            if preserve_conflict or state == "ALREADY_CORRECT"
+            else _write_jpeg_dates(exiftool, rebuilt, planned)
+        )
+        _verify_repair_output(
+            exiftool,
+            repaired,
+            original_fingerprint,
+            before.st_size,
+            match["extension"],
+            planned,
+            utc,
+            local,
+            preserved_entries,
+        )
+
+        backup_path = Path(str(path) + "_original")
+        safety_path = Path(str(path) + ".media-date-fixer-safety")
+        temp_path = Path(str(path) + ".media-date-fixer-repair")
+        protected = backup_path if not no_backup else safety_path
+        for candidate in (protected, temp_path):
+            if candidate.exists():
+                raise RuntimeError(f"기존 백업 또는 임시 파일을 덮어쓰지 않음: {candidate}")
+        if path.read_bytes() != original or not same_source_state(before, path.stat()):
+            raise RuntimeError("파일이 쓰기 직전 변경됨")
+        mode = stat.S_IMODE(before.st_mode)
+        _write_exclusive(protected, original, mode, before)
+        if protected.read_bytes() != original:
+            raise RuntimeError(f"안전 백업 검증 실패: {protected}")
+        restore_access_and_modify_times(protected, before)
+        _write_exclusive(temp_path, repaired, mode, before)
+        os.replace(temp_path, path)
+        replaced = True
+
+        final_data = path.read_bytes()
+        if final_data != repaired:
+            raise RuntimeError("원자적 교체 후 파일 바이트가 준비된 출력과 다름")
+        _verify_repair_output(
+            exiftool,
+            final_data,
+            original_fingerprint,
+            before.st_size,
+            match["extension"],
+            planned,
+            utc,
+            local,
+            preserved_entries,
+        )
+        restore_access_and_modify_times(path, before)
+        final = path.stat()
+        if final.st_atime_ns != before.st_atime_ns:
+            raise RuntimeError("파일 시스템 접근 시각 보존 실패")
+        if final.st_mtime_ns != before.st_mtime_ns:
+            raise RuntimeError("파일 시스템 수정 시각 보존 실패")
+        if os.name == "nt" and final.st_ctime_ns != before.st_ctime_ns:
+            raise RuntimeError("파일 시스템 생성 시각 보존 실패")
+        if no_backup:
+            os.unlink(safety_path)
+        result_row.update(
+            action="REPAIRED",
+            result="REPAIRED_CONFLICT" if preserve_conflict else "REPAIRED",
+            error="",
+        )
+        return result_row
+    except (OSError, RuntimeError, ValueError) as error:
+        rollback_error = None
+        if replaced and path is not None and before is not None:
+            try:
+                if no_backup:
+                    os.replace(safety_path, path)
+                else:
+                    _write_exclusive(temp_path, original, stat.S_IMODE(before.st_mode), before)
+                    os.replace(temp_path, path)
+                if path.read_bytes() != original:
+                    raise RuntimeError("롤백 후 원본 바이트가 일치하지 않음")
+                restore_access_and_modify_times(path, before)
+            except (OSError, RuntimeError) as problem:
+                rollback_error = problem
+        elif path is not None and before is not None and path.exists():
+            try:
+                restore_access_and_modify_times(path, before)
+            except OSError as problem:
+                rollback_error = problem
+        message = str(error)
+        if rollback_error:
+            message += f"; 롤백 실패: {rollback_error}"
+        result_row.update(action="SKIPPED", result="REPAIR_FAILED", error=message)
+        return result_row
+
+
+def repair_from_log(
+    log_path,
+    root,
+    *,
+    exiftool,
+    overwrite_existing=False,
+    no_backup=False,
+    log_dir=None,
+    emit=None,
+    on_progress=None,
+    should_stop=None,
+):
+    emit = emit or console_emit
+    root = Path(root).resolve()
+    log_path = Path(log_path)
+    log_dir = Path(log_dir) if log_dir else log_path.parent
+    try:
+        with log_path.open(encoding="utf-8-sig", newline="") as source:
+            candidates = [
+                row for row in csv.DictReader(source) if classify_repair_kind(row)
+            ]
+        log_dir.mkdir(parents=True, exist_ok=True)
+        repair_log = log_dir / datetime.now().strftime(
+            "repair_media_dates_%Y%m%d_%H%M%S_%f.csv"
+        )
+        stats = {
+            "total": len(candidates),
+            "repaired": 0,
+            "repaired_conflict": 0,
+            "repair_failed": 0,
+            "cancelled": 0,
+        }
+        with repair_log.open("x", encoding="utf-8-sig", newline="") as output:
+            writer = csv.DictWriter(output, fieldnames=CSV_FIELDS)
+            writer.writeheader()
+            for index, row in enumerate(candidates):
+                if should_stop and should_stop():
+                    stats["cancelled"] = 1
+                    break
+                repaired = repair_jpeg_other_image(
+                    root,
+                    row,
+                    exiftool=exiftool,
+                    overwrite_existing=overwrite_existing,
+                    no_backup=no_backup,
+                )
+                writer.writerow(repaired)
+                key = {
+                    "REPAIRED": "repaired",
+                    "REPAIRED_CONFLICT": "repaired_conflict",
+                    "REPAIR_FAILED": "repair_failed",
+                }[repaired["result"]]
+                stats[key] += 1
+                if on_progress:
+                    on_progress(index + 1, len(candidates), repaired["filename"])
+    except (OSError, csv.Error, KeyError, RuntimeError) as error:
+        emit(f"ERROR: JPEG 복구 실행 실패: {error}", error=True)
+        return 2, None, None
+    emit(f"Repair CSV log: {repair_log}")
+    if stats["cancelled"]:
+        return 130, stats, repair_log
+    return (1 if stats["repair_failed"] else 0), stats, repair_log
 
 
 def run_self_test():
@@ -722,6 +1108,30 @@ def run_self_test():
     )
     if os.name == "nt":
         assert not {"LANG", "LC_ALL", "LC_CTYPE"} & exiftool_environment().keys()
+    repairable = {
+        "extension": ".jpg",
+        "action": "SKIPPED",
+        "result": "FAILED",
+        "error": (
+            "Warning: Entries in IFD0 were out of sequence\n"
+            "Error reading OtherImageStart data in IFD1"
+        ),
+    }
+    assert classify_repair_kind(repairable) == REPAIR_KIND_JPEG_OTHER_IMAGE_START
+    for change in (
+        {"extension": ".png"},
+        {"action": "MODIFIED"},
+        {"result": "VERIFY_FAILED"},
+        {"error": "Error reading OtherImageLength data in IFD0"},
+        {"error": "Error reading OtherImageStart data in IFD2"},
+        {
+            "error": (
+                "Error reading OtherImageStart data in IFD0; "
+                "Error reading directory"
+            )
+        },
+    ):
+        assert not classify_repair_kind(repairable | change), change
     print("SELF_TEST PASSED")
 
 
@@ -976,6 +1386,7 @@ def _record_result(stats, writer, result):
         else:
             stats[key] += value
     if row is not None:
+        row["repair_kind"] = classify_repair_kind(row)
         writer.writerow(row)
 
 

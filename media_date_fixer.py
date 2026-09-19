@@ -8,10 +8,16 @@ import queue
 import sys
 import threading
 import tkinter as tk
+from collections import Counter
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from fix_media_dates import process_media
+from fix_media_dates import (
+    ERROR_RESULTS,
+    classify_repair_kind,
+    process_media,
+    repair_from_log,
+)
 
 
 APP_TITLE = "media date fixer"
@@ -88,6 +94,44 @@ def read_log_rows(path):
     return rows
 
 
+def error_summary(path):
+    errors = []
+    with Path(path).open(encoding="utf-8-sig", newline="") as log_file:
+        for row in csv.DictReader(log_file):
+            if row.get("result") in ERROR_RESULTS:
+                errors.append(row)
+    extensions = Counter(row.get("extension") or "(확장자 없음)" for row in errors)
+    return {
+        "total": len(errors),
+        "repairable": sum(bool(classify_repair_kind(row)) for row in errors),
+        "extensions": extensions,
+    }
+
+
+def error_message(summary, *, apply_changes):
+    lines = [f"{summary['total']:,}개의 파일에 오류가 발생하였습니다."]
+    repairable = summary["repairable"]
+    if summary["extensions"] and not (apply_changes and repairable):
+        lines.append(
+            "형식별 오류: "
+            + ", ".join(
+                f"{extension} {count:,}개"
+                for extension, count in sorted(summary["extensions"].items())
+            )
+        )
+    lines += [
+        f"자동 복구 가능 JPEG: {repairable:,}개",
+        f"현재 미지원: {summary['total'] - repairable:,}개",
+    ]
+    if apply_changes and repairable:
+        lines.append("복구 가능한 파일을 복구하시겠습니까?")
+    elif apply_changes:
+        lines.append("현재 지원되는 자동 복구가 없습니다.")
+    else:
+        lines.append("Dry Run에서는 파일을 변경하거나 복구하지 않습니다.")
+    return "\n".join(lines)
+
+
 def checkbox_image(master, selected):
     image = tk.PhotoImage(master=master, width=20, height=16)
     image.put("white", to=(0, 0, 20, 16))
@@ -124,6 +168,8 @@ class MediaDateFixerApp:
         self.backup = tk.BooleanVar(value=True)
         self.workers = tk.StringVar(value="2개")
         self.active_workers = 1
+        self.operation = "run"
+        self.run_context = None
         self.status = tk.StringVar(value="대기 중")
         self.percent = tk.StringVar(value="0%")
         self.summary = [tk.StringVar(value="0") for _ in range(4)]
@@ -409,6 +455,8 @@ class MediaDateFixerApp:
             "workers": workers,
         }
         self.active_workers = workers
+        self.operation = "run"
+        self.run_context = (folder, options)
         self.cancel_event.clear()
         self.errors.clear()
         self.close_when_done = False
@@ -444,6 +492,30 @@ class MediaDateFixerApp:
             result = (1, None, None)
         self.events.put(("result", *result))
 
+    def _repair_worker(self, folder, source_log, options, unsupported):
+        def emit(message, error=False):
+            self.events.put(("message", message, error))
+
+        def progress(current, total, detail):
+            self.events.put(("progress", current, total, detail))
+
+        try:
+            result = repair_from_log(
+                source_log,
+                folder,
+                exiftool=options["exiftool"],
+                overwrite_existing=options["overwrite_existing"],
+                no_backup=options["no_backup"],
+                log_dir=options["log_dir"],
+                emit=emit,
+                on_progress=progress,
+                should_stop=self.cancel_event.is_set,
+            )
+        except Exception as error:
+            emit(f"JPEG 복구 실패: {error}", error=True)
+            result = (2, None, None)
+        self.events.put(("repair_result", *result, unsupported))
+
     def _poll_worker(self):
         try:
             while True:
@@ -454,6 +526,8 @@ class MediaDateFixerApp:
                     self._show_progress(*event[1:])
                 elif event[0] == "result":
                     self._finish(*event[1:])
+                elif event[0] == "repair_result":
+                    self._finish_repair(*event[1:])
         except queue.Empty:
             pass
         if self.busy:
@@ -474,7 +548,8 @@ class MediaDateFixerApp:
         elif detail == "완료":
             self.status.set("완료")
         else:
-            self.status.set(f"{total:,}개 중 {current:,}개 처리 중")
+            work = "복구" if self.operation == "repair" else "처리"
+            self.status.set(f"{total:,}개 중 {current:,}개 {work} 중")
 
     def _finish(self, code, stats, path):
         self.progress.stop()
@@ -492,13 +567,77 @@ class MediaDateFixerApp:
             error_count = stats["failed"] + stats["verify_failed"]
             self.status.set(f"완료 ({error_count:,}개 오류)")
             self.percent.set("100%")
-            if self.errors:
-                messagebox.showerror(APP_TITLE, self.errors[-1])
         else:
             self.status.set("오류")
             self.percent.set("0%")
+        if self.errors:
+            messagebox.showerror(APP_TITLE, self.errors[-1])
+        if stats is not None and code != 130 and not self.errors and path is not None:
+            try:
+                summary = error_summary(path)
+            except (OSError, csv.Error, KeyError) as error:
+                messagebox.showerror(APP_TITLE, f"오류 집계 실패: {error}")
+            else:
+                if summary["total"]:
+                    apply_changes = self.run_context[1]["apply_changes"]
+                    prompt = error_message(summary, apply_changes=apply_changes)
+                    if (
+                        apply_changes
+                        and summary["repairable"]
+                        and messagebox.askyesno(APP_TITLE, prompt)
+                    ):
+                        self._start_repair(
+                            path,
+                            summary["total"] - summary["repairable"],
+                        )
+                        return
+                    if not (apply_changes and summary["repairable"]):
+                        messagebox.showinfo(APP_TITLE, prompt)
+        self._set_busy(False)
+        if self.close_when_done:
+            self.root.destroy()
+
+    def _start_repair(self, source_log, unsupported):
+        folder, options = self.run_context
+        self.operation = "repair"
+        self.active_workers = 1
+        self.errors.clear()
+        self.status.set("JPEG 오류 복구 준비 중")
+        self.percent.set("0%")
+        self.progress.configure(mode="determinate", value=0)
+        threading.Thread(
+            target=self._repair_worker,
+            args=(folder, source_log, options, unsupported),
+            daemon=False,
+        ).start()
+
+    def _finish_repair(self, code, stats, path, unsupported):
+        self.progress.stop()
+        self.last_log = path
+        if stats is not None and path is not None:
+            self._show_log(path)
+        if stats is None:
+            self.status.set("복구 오류")
+            self.percent.set("0%")
             if self.errors:
                 messagebox.showerror(APP_TITLE, self.errors[-1])
+        elif code == 130:
+            self.status.set("복구 중단됨")
+        else:
+            self.status.set(
+                "복구 완료"
+                if not stats["repair_failed"]
+                else f"복구 완료 ({stats['repair_failed']:,}개 실패)"
+            )
+            self.percent.set("100%")
+            messagebox.showinfo(
+                APP_TITLE,
+                f"복구 성공: {stats['repaired']:,}개\n"
+                f"날짜 충돌 보존: {stats['repaired_conflict']:,}개\n"
+                f"실패: {stats['repair_failed']:,}개\n"
+                f"미지원 오류: {unsupported:,}개\n"
+                f"복구 CSV: {path}",
+            )
         self._set_busy(False)
         if self.close_when_done:
             self.root.destroy()
@@ -569,6 +708,24 @@ def run_self_test():
         "verify_failed": 0,
     }
     assert summary_values(stats) == (10, 1, 3, 7)
+    repairable_summary = {
+        "total": 3,
+        "repairable": 1,
+        "extensions": Counter({".jpg": 1, ".png": 1, ".mp4": 1}),
+    }
+    apply_prompt = error_message(repairable_summary, apply_changes=True)
+    assert "3개의 파일에 오류가 발생하였습니다." in apply_prompt
+    assert "자동 복구 가능 JPEG: 1개" in apply_prompt
+    assert "현재 미지원: 2개" in apply_prompt
+    assert apply_prompt.endswith("복구 가능한 파일을 복구하시겠습니까?")
+    dry_prompt = error_message(repairable_summary, apply_changes=False)
+    assert "복구하시겠습니까?" not in dry_prompt
+    assert "파일을 변경하거나 복구하지 않습니다" in dry_prompt
+    unsupported_prompt = error_message(
+        {"total": 2, "repairable": 0, "extensions": Counter({".mov": 2})},
+        apply_changes=True,
+    )
+    assert unsupported_prompt.endswith("현재 지원되는 자동 복구가 없습니다.")
     assert application_directory().is_dir()
     assert log_directory().name == "Logs"
     root = tk.Tk()
@@ -588,6 +745,58 @@ def run_self_test():
         app._finish(1, stats | {"failed": 2, "verify_failed": 1}, None)
         assert app.percent.get() == "100%"
         assert app.status.get() == "완료 (3개 오류)"
+
+        original_error_summary = globals()["error_summary"]
+        original_ask = messagebox.askyesno
+        original_info = messagebox.showinfo
+        original_error = messagebox.showerror
+        try:
+            starts = []
+            infos = []
+            asks = []
+            globals()["error_summary"] = lambda path: repairable_summary
+            messagebox.askyesno = lambda title, text: asks.append(text) or True
+            messagebox.showinfo = lambda title, text: infos.append(text)
+            messagebox.showerror = lambda title, text: None
+            app._start_repair = lambda path, unsupported: starts.append(
+                (path, unsupported)
+            )
+            app.run_context = (Path("."), {"apply_changes": True})
+            app.errors.clear()
+            fake_log = Path("apply.csv")
+            app._finish(1, stats | {"failed": 1, "verify_failed": 0}, fake_log)
+            assert asks and starts == [(fake_log, 2)]
+
+            asks.clear()
+            infos.clear()
+            starts.clear()
+            app.run_context = (Path("."), {"apply_changes": False})
+            app._finish(1, stats | {"failed": 1, "verify_failed": 0}, fake_log)
+            assert not asks and not starts and infos
+
+            asks.clear()
+            infos.clear()
+            globals()["error_summary"] = lambda path: {
+                "total": 2,
+                "repairable": 0,
+                "extensions": Counter({".mov": 2}),
+            }
+            app.run_context = (Path("."), {"apply_changes": True})
+            app._finish(1, stats | {"failed": 2, "verify_failed": 0}, fake_log)
+            assert not asks and infos and "지원되는 자동 복구가 없습니다" in infos[-1]
+
+            calls = []
+            globals()["error_summary"] = lambda path: calls.append(path) or repairable_summary
+            app.errors[:] = ["fatal"]
+            app._finish(1, stats | {"failed": 1, "verify_failed": 0}, fake_log)
+            app.errors.clear()
+            app._finish(130, stats | {"failed": 1, "verify_failed": 0}, fake_log)
+            assert not calls
+        finally:
+            globals()["error_summary"] = original_error_summary
+            messagebox.askyesno = original_ask
+            messagebox.showinfo = original_info
+            messagebox.showerror = original_error
     finally:
         root.destroy()
     print("GUI SELF_TEST PASSED")
