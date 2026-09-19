@@ -16,6 +16,7 @@ from fix_media_dates import process_media
 
 APP_TITLE = "media date fixer"
 WINDOWS_BLUE = "#0078d4"
+WINDOWS_GREEN = "#107c10"
 PREVIEW_ROW_LIMIT = 1000
 
 
@@ -87,6 +88,28 @@ def read_log_rows(path):
     return rows
 
 
+def checkbox_image(master, selected):
+    image = tk.PhotoImage(master=master, width=20, height=16)
+    image.put("white", to=(0, 0, 20, 16))
+    image.put("#767676", to=(0, 0, 16, 16))
+    image.put("white", to=(1, 1, 15, 15))
+    if selected:
+        for x, y in (
+            (3, 7),
+            (4, 8),
+            (5, 9),
+            (6, 10),
+            (7, 9),
+            (8, 8),
+            (9, 7),
+            (10, 6),
+            (11, 5),
+            (12, 4),
+        ):
+            image.put(WINDOWS_GREEN, to=(x, y, x + 2, y + 2))
+    return image
+
+
 class MediaDateFixerApp:
     def __init__(self, root):
         self.root = root
@@ -102,6 +125,8 @@ class MediaDateFixerApp:
         self.status = tk.StringVar(value="대기 중")
         self.percent = tk.StringVar(value="0%")
         self.summary = [tk.StringVar(value="0") for _ in range(4)]
+        self.checkbox_off = checkbox_image(root, False)
+        self.checkbox_on = checkbox_image(root, True)
 
         root.title(APP_TITLE)
         root.geometry("1000x700")
@@ -142,11 +167,34 @@ class MediaDateFixerApp:
             "Accent.TButton",
             background=[("active", "#106ebe"), ("pressed", "#005a9e")],
         )
-        style.configure("TCheckbutton", background="white", foreground="black")
+        style.layout(
+            "Green.TCheckbutton",
+            [
+                (
+                    "Checkbutton.padding",
+                    {
+                        "sticky": "nswe",
+                        "children": [
+                            (
+                                "Checkbutton.focus",
+                                {
+                                    "side": "left",
+                                    "sticky": "w",
+                                    "children": [
+                                        ("Checkbutton.label", {"sticky": "nswe"})
+                                    ],
+                                },
+                            )
+                        ],
+                    },
+                )
+            ],
+        )
+        style.configure("Green.TCheckbutton", background="white", foreground="black")
         style.map(
-            "TCheckbutton",
+            "Green.TCheckbutton",
             background=[("active", "white")],
-            indicatorcolor=[("selected", WINDOWS_BLUE), ("!selected", "white")],
+            foreground=[("disabled", "#767676")],
         )
         style.configure(
             "Horizontal.TProgressbar",
@@ -207,11 +255,21 @@ class MediaDateFixerApp:
         )
         self.apply_button.pack(side="left", padx=(12, 28), ipadx=28)
         self.overwrite_button = ttk.Checkbutton(
-            actions, text="기존 날짜 덮어쓰기", variable=self.overwrite
+            actions,
+            text="기존 날짜 덮어쓰기",
+            variable=self.overwrite,
+            style="Green.TCheckbutton",
+            image=(self.checkbox_off, "selected", self.checkbox_on),
+            compound="left",
         )
         self.overwrite_button.pack(side="left", padx=(0, 20))
         self.backup_button = ttk.Checkbutton(
-            actions, text="원본 백업 만들기", variable=self.backup
+            actions,
+            text="원본 백업 만들기",
+            variable=self.backup,
+            style="Green.TCheckbutton",
+            image=(self.checkbox_off, "selected", self.checkbox_on),
+            compound="left",
         )
         self.backup_button.pack(side="left")
 
@@ -489,6 +547,18 @@ def run_self_test():
     assert summary_values(stats) == (10, 1, 3, 7)
     assert application_directory().is_dir()
     assert log_directory().name == "Logs"
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        app = MediaDateFixerApp(root)
+        root.update_idletasks()
+        assert "indicator" not in str(ttk.Style(root).layout("Green.TCheckbutton"))
+        assert app.checkbox_on.get(10, 6) == (16, 124, 16)
+        assert app.checkbox_off.get(10, 6) == (255, 255, 255)
+        app.overwrite_button.invoke()
+        assert app.overwrite.get()
+    finally:
+        root.destroy()
     print("GUI SELF_TEST PASSED")
 
 
