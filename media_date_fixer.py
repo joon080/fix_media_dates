@@ -459,7 +459,7 @@ class MediaDateFixerApp:
         elif detail == "완료":
             self.status.set("완료")
         else:
-            self.status.set(f"{current:,}개 중 {total:,}개 처리 중")
+            self.status.set(f"{total:,}개 중 {current:,}개 처리 중")
 
     def _finish(self, code, stats, path):
         self.progress.stop()
